@@ -1,0 +1,5 @@
+aws_region  = "us-east-1"
+project     = "pms"
+db_username = "pmsadmin"
+db_password = "ChangeMe123!"   # must be >= 8 chars
+db_name     = "pmsdb"

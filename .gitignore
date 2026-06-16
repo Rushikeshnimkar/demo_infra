@@ -1,0 +1,22 @@
+# Terraform — never commit these
+terraform.tfstate
+terraform.tfstate.backup
+terraform/terraform.tfvars
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/.terraform/
+terraform/.terraform.tfstate.lock.info
+terraform/override.tf
+terraform/override.tf.json
+terraform/*_override.tf
+terraform/*_override.tf.json
+
+# Compiled Lambda binaries and zips
+bin/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Go build cache
+*.test
+*.out
