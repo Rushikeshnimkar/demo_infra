@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 
@@ -27,86 +28,130 @@ func Ping(ctx context.Context) error {
 }
 
 func Migrate(ctx context.Context) error {
+	// Check if we're already on the new schema (tenant table exists).
+	// If not, drop the old tenant_config table and create both new tables.
+	var newSchemaExists bool
+	conn.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.tables
+			WHERE table_schema='public' AND table_name='tenant'
+		)
+	`).Scan(&newSchemaExists)
+
+	if !newSchemaExists {
+		if _, err := conn.ExecContext(ctx, `DROP TABLE IF EXISTS tenant_config CASCADE`); err != nil {
+			return fmt.Errorf("drop old schema: %w", err)
+		}
+	}
+
 	_, err := conn.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS tenant_config (
-			tenant_id   VARCHAR(50)   PRIMARY KEY,
-			name        VARCHAR(255)  NOT NULL,
-			timezone    VARCHAR(100)  NOT NULL DEFAULT 'UTC',
-			run_time    VARCHAR(5)    NOT NULL DEFAULT '',
-			enabled     BOOLEAN       NOT NULL DEFAULT true,
-			latitude    DECIMAL(9,6)  NOT NULL DEFAULT 0,
-			longitude   DECIMAL(9,6)  NOT NULL DEFAULT 0,
-			hotel_code  VARCHAR(50),
-			created_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
-			updated_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+		CREATE TABLE IF NOT EXISTS tenant (
+			tenant_id    VARCHAR(50)  PRIMARY KEY,
+			pms_provider VARCHAR(100) NOT NULL,
+			created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 		);
-		ALTER TABLE tenant_config ADD COLUMN IF NOT EXISTS schedule_type VARCHAR(10) NOT NULL DEFAULT 'daily';
-		ALTER TABLE tenant_config ADD COLUMN IF NOT EXISTS rate_minutes  INT         NOT NULL DEFAULT 0;
+		CREATE TABLE IF NOT EXISTS tenant_config (
+			tenant_id  VARCHAR(50) PRIMARY KEY REFERENCES tenant(tenant_id) ON DELETE CASCADE,
+			config     JSONB       NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
 	`)
 	return err
 }
 
-func CreateTenant(ctx context.Context, t *models.Tenant) error {
-	_, err := conn.ExecContext(ctx, `
-		INSERT INTO tenant_config
-			(tenant_id, name, schedule_type, timezone, run_time, rate_minutes, enabled, latitude, longitude, hotel_code)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-	`, t.TenantID, t.Name, t.ScheduleType, t.Timezone, t.RunTime, t.RateMinutes, t.Enabled,
-		t.Latitude, t.Longitude, t.HotelCode)
-	return err
+func CreateTenant(ctx context.Context, tenantID, pmsProvider string, cfg models.ScheduleConfig) error {
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx,
+		`INSERT INTO tenant (tenant_id, pms_provider) VALUES ($1, $2)`,
+		tenantID, pmsProvider,
+	); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx,
+		`INSERT INTO tenant_config (tenant_id, config) VALUES ($1, $2)`,
+		tenantID, cfgJSON,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func GetTenant(ctx context.Context, tenantID string) (*models.Tenant, error) {
-	t := &models.Tenant{}
+func GetTenant(ctx context.Context, tenantID string) (*models.TenantWithConfig, error) {
+	var t models.TenantWithConfig
+	var cfgJSON []byte
 	err := conn.QueryRowContext(ctx, `
-		SELECT tenant_id, name, schedule_type, timezone, run_time, rate_minutes, enabled,
-		       latitude, longitude, hotel_code, created_at, updated_at
-		FROM tenant_config WHERE tenant_id = $1
-	`, tenantID).Scan(
-		&t.TenantID, &t.Name, &t.ScheduleType, &t.Timezone, &t.RunTime, &t.RateMinutes, &t.Enabled,
-		&t.Latitude, &t.Longitude, &t.HotelCode, &t.CreatedAt, &t.UpdatedAt,
-	)
+		SELECT t.tenant_id, t.pms_provider, t.created_at, tc.config, tc.updated_at
+		FROM tenant t
+		JOIN tenant_config tc ON t.tenant_id = tc.tenant_id
+		WHERE t.tenant_id = $1
+	`, tenantID).Scan(&t.TenantID, &t.PMSProvider, &t.CreatedAt, &cfgJSON, &t.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	return t, err
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(cfgJSON, &t.Config); err != nil {
+		return nil, fmt.Errorf("unmarshal config: %w", err)
+	}
+	return &t, nil
 }
 
-func ListTenants(ctx context.Context) ([]*models.Tenant, error) {
+func ListTenants(ctx context.Context) ([]*models.TenantWithConfig, error) {
 	rows, err := conn.QueryContext(ctx, `
-		SELECT tenant_id, name, schedule_type, timezone, run_time, rate_minutes, enabled,
-		       latitude, longitude, hotel_code, created_at, updated_at
-		FROM tenant_config ORDER BY tenant_id
+		SELECT t.tenant_id, t.pms_provider, t.created_at, tc.config, tc.updated_at
+		FROM tenant t
+		JOIN tenant_config tc ON t.tenant_id = tc.tenant_id
+		ORDER BY t.tenant_id
 	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var list []*models.Tenant
+	var list []*models.TenantWithConfig
 	for rows.Next() {
-		t := &models.Tenant{}
-		if err := rows.Scan(
-			&t.TenantID, &t.Name, &t.ScheduleType, &t.Timezone, &t.RunTime, &t.RateMinutes, &t.Enabled,
-			&t.Latitude, &t.Longitude, &t.HotelCode, &t.CreatedAt, &t.UpdatedAt,
-		); err != nil {
+		var t models.TenantWithConfig
+		var cfgJSON []byte
+		if err := rows.Scan(&t.TenantID, &t.PMSProvider, &t.CreatedAt, &cfgJSON, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
-		list = append(list, t)
+		if err := json.Unmarshal(cfgJSON, &t.Config); err != nil {
+			return nil, fmt.Errorf("unmarshal config: %w", err)
+		}
+		list = append(list, &t)
 	}
 	return list, nil
 }
 
-func UpdateTenantSchedule(ctx context.Context, tenantID, scheduleType, timezone, runTime string, rateMinutes int, enabled bool) error {
-	_, err := conn.ExecContext(ctx, `
-		UPDATE tenant_config
-		SET schedule_type=$1, timezone=$2, run_time=$3, rate_minutes=$4, enabled=$5, updated_at=NOW()
-		WHERE tenant_id=$6
-	`, scheduleType, timezone, runTime, rateMinutes, enabled, tenantID)
-	return err
+func UpdateTenantConfig(ctx context.Context, tenantID string, cfg models.ScheduleConfig) error {
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	result, err := conn.ExecContext(ctx, `
+		UPDATE tenant_config SET config=$1, updated_at=NOW() WHERE tenant_id=$2
+	`, cfgJSON, tenantID)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func DeleteTenant(ctx context.Context, tenantID string) error {
-	_, err := conn.ExecContext(ctx, `DELETE FROM tenant_config WHERE tenant_id=$1`, tenantID)
+	_, err := conn.ExecContext(ctx, `DELETE FROM tenant WHERE tenant_id=$1`, tenantID)
 	return err
 }

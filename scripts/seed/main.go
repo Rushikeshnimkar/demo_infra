@@ -1,4 +1,4 @@
-// Seed creates 10 sample tenants by calling the live API.
+// Seed creates sample tenants by calling the live API.
 // Usage: API_URL=https://your-api.execute-api.us-east-1.amazonaws.com go run ./scripts/seed
 package main
 
@@ -12,27 +12,30 @@ import (
 	"os"
 )
 
+type scheduleConfig struct {
+	Name     string `json:"name"`
+	Timezone string `json:"timezone"`
+	Cron     string `json:"cron"`
+	Enabled  bool   `json:"enabled"`
+}
+
 type tenantReq struct {
-	TenantID  string  `json:"tenantId"`
-	Name      string  `json:"name"`
-	Timezone  string  `json:"timezone"`
-	RunTime   string  `json:"runTime"`
-	Latitude  float64 `json:"latitude"`
-	Longitude float64 `json:"longitude"`
-	HotelCode string  `json:"hotelCode"`
+	TenantID    string         `json:"tenantId"`
+	PMSProvider string         `json:"pmsProvider"`
+	Config      scheduleConfig `json:"config"`
 }
 
 var tenants = []tenantReq{
-	{"tenant-001", "Grand Hotel Mumbai",       "Asia/Kolkata",      "07:00",  19.0760,   72.8777,  "H001"},
-	{"tenant-002", "NYC Plaza Hotel",          "America/New_York",  "09:00",  40.7580,  -73.9855,  "H002"},
-	{"tenant-003", "London Bridge Hotel",      "Europe/London",     "18:00",  51.5080,   -0.1281,  "H003"},
-	{"tenant-004", "Tokyo Imperial Hotel",     "Asia/Tokyo",        "06:00",  35.6895,  139.6917,  "H004"},
-	{"tenant-005", "Dubai Oasis Resort",       "Asia/Dubai",        "08:00",  25.2048,   55.2708,  "H005"},
-	{"tenant-006", "Sydney Harbour Hotel",     "Australia/Sydney",  "10:00", -33.8688,  151.2093,  "H006"},
-	{"tenant-007", "Paris Grand Hotel",        "Europe/Paris",      "20:00",  48.8566,    2.3522,  "H007"},
-	{"tenant-008", "Singapore Marina Hotel",   "Asia/Singapore",    "11:00",   1.2904,  103.8519,  "H008"},
-	{"tenant-009", "São Paulo Business Hotel", "America/Sao_Paulo", "14:00", -23.5489,  -46.6388,  "H009"},
-	{"tenant-010", "Toronto Skyline Hotel",    "America/Toronto",   "07:30",  43.6532,  -79.3832,  "H010"},
+	{"tenant-001", "Opera",   scheduleConfig{"tenant-001-run", "Asia/Kolkata",      "cron(0 7  * * ? *)", true}},
+	{"tenant-002", "Mews",    scheduleConfig{"tenant-002-run", "America/New_York",  "cron(0 9  * * ? *)", true}},
+	{"tenant-003", "Apaleo",  scheduleConfig{"tenant-003-run", "Europe/London",     "cron(0 18 * * ? *)", true}},
+	{"tenant-004", "Opera",   scheduleConfig{"tenant-004-run", "Asia/Tokyo",        "cron(0 6  * * ? *)", true}},
+	{"tenant-005", "Mews",    scheduleConfig{"tenant-005-run", "Asia/Dubai",        "cron(0 8  * * ? *)", true}},
+	{"tenant-006", "Apaleo",  scheduleConfig{"tenant-006-run", "Australia/Sydney",  "cron(0 10 * * ? *)", true}},
+	{"tenant-007", "Opera",   scheduleConfig{"tenant-007-run", "Europe/Paris",      "cron(0 20 * * ? *)", true}},
+	{"tenant-008", "Mews",    scheduleConfig{"tenant-008-run", "Asia/Singapore",    "cron(0 11 * * ? *)", true}},
+	{"tenant-009", "Apaleo",  scheduleConfig{"tenant-009-run", "America/Sao_Paulo", "cron(0 14 * * ? *)", true}},
+	{"tenant-010", "Opera",   scheduleConfig{"tenant-010-run", "America/Toronto",   "cron(30 7 * * ? *)", true}},
 }
 
 func main() {
@@ -55,7 +58,7 @@ func main() {
 		resp.Body.Close()
 
 		if resp.StatusCode == 201 {
-			fmt.Printf("✓ %s | %-35s | %s %s\n", t.TenantID, t.Name, t.RunTime, t.Timezone)
+			fmt.Printf("✓ %s | %-12s | %s | %s\n", t.TenantID, t.PMSProvider, t.Config.Cron, t.Config.Timezone)
 			created++
 		} else {
 			fmt.Printf("✗ %s | HTTP %d: %s\n", t.TenantID, resp.StatusCode, string(respBody))
