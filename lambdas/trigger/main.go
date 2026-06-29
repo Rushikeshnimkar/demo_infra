@@ -58,7 +58,6 @@ func handler(ctx context.Context, event TriggerEvent) error {
 	slog.Info("db: tenant loaded",
 		"tenantId", tenant.TenantID,
 		"pmsProvider", tenant.PMSProvider,
-		"scheduleName", tenant.Config.Name,
 	)
 
 	payload := sqsPayload{

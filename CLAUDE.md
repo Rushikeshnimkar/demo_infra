@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project does
 
-Multi-tenant PMS scheduler: each tenant has a PMS provider and a schedule config stored in RDS. A backend API creates/updates one **EventBridge Scheduler** per tenant using the cron expression and timezone from the config. At the scheduled time, EventBridge invokes the **Trigger Lambda**, which reads the tenant record from DB and pushes a JSON payload to SQS. RDS is the source of truth; schedulers are derived resources and can be recreated from the DB at any time.
+Multi-tenant PMS scheduler: each tenant has a PMS provider and a JSONB config (for non-schedule metadata) stored in RDS. **Schedule details (cron expression, timezone, enabled state) live only in EventBridge** — they are never stored in the database. The API creates/updates one EventBridge Scheduler per tenant and reads schedule info back from EventBridge on demand. At the scheduled time, EventBridge invokes the Trigger Lambda, which loads the tenant from DB and pushes a JSON payload to SQS.
+
+**EventBridge is the source of truth for schedules. RDS is the source of truth for tenant identity and metadata.**
 
 ## Build commands
 
@@ -52,46 +54,46 @@ All routes are handled by the API Lambda behind HTTP API Gateway v2.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET`  | `/health` | DB liveness check |
-| `GET`  | `/tenants` | List all tenants with config |
-| `POST` | `/tenants` | Create tenant + EventBridge Scheduler |
-| `GET`  | `/tenants/{id}` | Get tenant with config |
-| `PUT`  | `/tenants/{id}/config` | Replace config JSON + reschedule |
-| `DELETE` | `/tenants/{id}` | Delete tenant + remove scheduler |
-
-> **Note:** The old flat fields (`name`, `scheduleType`, `runTime`, `rateMinutes`, `latitude`, `longitude`, `hotelCode`) are gone. All schedule details now live inside the nested `config` object. See the **API reference** section below for full curl examples.
+| `GET`  | `/tenants` | List tenants with config (no schedule details) |
+| `POST` | `/tenants` | Create tenant + config in DB, create EventBridge Scheduler |
+| `GET`  | `/tenants/{id}` | Get tenant + config from DB + live schedule from EventBridge |
+| `PUT`  | `/tenants/{id}/schedule` | Update EventBridge Scheduler only — no DB write |
+| `PUT`  | `/tenants/{id}/config` | Update tenant_config JSONB in DB only — no EventBridge call |
+| `DELETE` | `/tenants/{id}` | Delete tenant from DB + delete scheduler |
 
 ## Database schema
 
-Two tables — `tenant` is the parent, `tenant_config` holds the JSONB schedule config.
+One table — `config` JSONB column holds arbitrary non-schedule metadata alongside tenant identity.
 
 ```sql
 CREATE TABLE tenant (
     tenant_id    VARCHAR(50)  PRIMARY KEY,
     pms_provider VARCHAR(100) NOT NULL,
-    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE tenant_config (
-    tenant_id  VARCHAR(50) PRIMARY KEY REFERENCES tenant(tenant_id) ON DELETE CASCADE,
-    config     JSONB       NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    config       JSONB        NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 ```
 
-`config` JSONB shape: `{ name, timezone, cron, enabled }`.
+`config` JSONB holds arbitrary tenant metadata — hotel name, codes, etc. **It does not contain schedule fields** (expression, timezone, cron, enabled). Those live only in EventBridge.
 
 ## Key design decisions
 
-**Scheduler upsert pattern** (`internal/scheduler/scheduler.go`): `UpdateSchedule` is tried first; only if `ResourceNotFoundException` is returned does `CreateSchedule` run. This avoids a redundant `GetSchedule` round-trip on the hot path.
+**Schedule data lives only in EventBridge**: `PUT /tenants/{id}/schedule` calls `UpdateSchedule` / `CreateSchedule` and does not touch the database. `GET /tenants/{id}` calls `GetSchedule` to read live schedule info. This removes any risk of DB and EventBridge drifting out of sync on schedule state.
 
-**Cron passed through directly**: callers supply the full EventBridge cron expression (e.g. `cron(0 7 * * ? *)`). There is no server-side conversion from `HH:MM`. `ScheduleExpressionTimezone` handles DST automatically.
+**Config JSONB holds non-schedule metadata only**: `PUT /tenants/{id}/config` writes to `tenant_config` only — it never touches EventBridge. This gives each tenant a flexible store for hotel names, codes, and any other PMS-specific data.
 
-**Schedule first, DB second**: on create and update, the EventBridge scheduler is created/updated before the DB write. If the DB write fails, the scheduler is deleted as a best-effort rollback.
+**Scheduler name = tenantID**: The EventBridge scheduler name is always derived as `tenantID` (e.g. tenant `"tenant-001"` → scheduler `"tenant-001"`). Deterministic — no need to store the name anywhere.
 
-**DB migration** (`internal/db/db.go:Migrate()`): runs in `init()` on cold start. Detects old schema by checking for the `tenant` table. If absent, drops the legacy `tenant_config` table and creates both new tables. Idempotent on subsequent cold starts.
+**Scheduler upsert pattern** (`internal/scheduler/scheduler.go`): `UpdateSchedule` is tried first; only if `ResourceNotFoundException` is returned does `CreateSchedule` run. Avoids a redundant `GetSchedule` round-trip on the hot path.
 
-**One provider per tenant**: `pms_provider` is a plain VARCHAR on the `tenant` row. There is no separate provider table.
+**Schedule first, DB second on create**: On `POST /tenants`, the EventBridge scheduler is created before the DB transaction. If the DB transaction fails, the scheduler is deleted as a best-effort rollback.
+
+**Terraform-managed initial schedulers use `ignore_changes = all`**: Pre-defined schedulers in `terraform/scheduler.tf` are created once by Terraform. After that, `lifecycle { ignore_changes = all }` prevents any `terraform apply` from modifying them — the API Lambda owns their state from that point forward.
+
+**DB migration** (`internal/db/db.go:Migrate()`): runs in `init()` on cold start. Drops `tenant_config` if it exists (legacy cleanup), then creates the single `tenant` table with `IF NOT EXISTS` — idempotent.
+
+**One provider per tenant**: `pms_provider` is a plain VARCHAR on the `tenant` row.
 
 ## Environment variables
 
@@ -109,14 +111,20 @@ All are injected by Terraform via `aws_lambda_function.environment`.
 ## Project structure
 
 ```
-internal/models/    ScheduleConfig, TenantWithConfig, request types
-internal/db/        PostgreSQL CRUD (pgx/v5/stdlib); tenant + tenant_config tables
-internal/scheduler/ EventBridge Scheduler upsert/delete
-lambdas/api/        HTTP API Lambda — routing, scheduler upsert, DB write
+internal/models/    Tenant, ScheduleInfo, TenantWithSchedule, request types
+internal/db/        PostgreSQL CRUD (pgx/v5/stdlib); single tenant table with config JSONB
+internal/scheduler/ EventBridge Scheduler get/upsert/delete
+lambdas/api/        HTTP API Lambda — routing, EventBridge calls, DB writes
 lambdas/trigger/    EventBridge target Lambda — load tenant, push to SQS
 scripts/seed/       one-shot CLI to POST 10 sample tenants to the live API
-terraform/          all infra except individual tenant schedulers
+terraform/          all infra + pre-defined tenant schedulers (ignore_changes)
 ```
+
+## Terraform ownership
+
+Terraform manages: Scheduler Group, pre-defined tenant schedulers (with `ignore_changes = all`), both Lambdas, SQS + DLQ, IAM roles, API Gateway, CloudWatch log groups, RDS.
+
+Pre-defined schedulers in `terraform/scheduler.tf` are created once on first `terraform apply` and then **never modified by Terraform again** — add `lifecycle { ignore_changes = all }` to every `aws_scheduler_schedule` resource. Dynamically created tenants (via `POST /tenants`) are managed entirely by the API Lambda.
 
 ## API reference
 
@@ -144,6 +152,8 @@ curl $BASE_URL/health
 
 ### GET /tenants
 
+Returns all tenants with their config from DB. Does **not** include schedule details — call `GET /tenants/{id}` for those.
+
 ```bash
 curl $BASE_URL/tenants
 ```
@@ -152,16 +162,10 @@ curl $BASE_URL/tenants
 ```json
 [
   {
-    "tenantId": "tenant-001",
+    "tenantId":    "tenant-001",
     "pmsProvider": "Opera",
-    "config": {
-      "name": "tenant-001-run",
-      "timezone": "Asia/Kolkata",
-      "cron": "cron(0 7 * * ? *)",
-      "enabled": true
-    },
-    "createdAt": "2026-06-28T10:00:00Z",
-    "updatedAt": "2026-06-28T10:00:00Z"
+    "config":      { "name": "Grand Hotel", "hotelCode": "GH001" },
+    "createdAt":   "2026-06-29T10:00:00Z"
   }
 ]
 ```
@@ -172,7 +176,7 @@ Returns `[]` when no tenants exist.
 
 ### POST /tenants
 
-Creates the tenant, its config, and an EventBridge Scheduler. Scheduler is created first; the DB write is rolled back (scheduler deleted) on failure.
+Creates the EventBridge Scheduler first, then inserts tenant + config into DB in a transaction. Rolls back the scheduler on DB failure.
 
 ```bash
 curl -X POST $BASE_URL/tenants \
@@ -180,12 +184,10 @@ curl -X POST $BASE_URL/tenants \
   -d '{
     "tenantId":    "tenant-001",
     "pmsProvider": "Opera",
-    "config": {
-      "name":     "tenant-001-run",
-      "timezone": "Asia/Kolkata",
-      "cron":     "cron(0 7 * * ? *)",
-      "enabled":  true
-    }
+    "config":      { "name": "Grand Hotel", "hotelCode": "GH001" },
+    "expression":  "cron(0 7 * * ? *)",
+    "timezone":    "Asia/Kolkata",
+    "enabled":     true
   }'
 ```
 
@@ -193,54 +195,46 @@ curl -X POST $BASE_URL/tenants \
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `tenantId` | string | yes | Primary key, max 50 chars |
+| `tenantId` | string | yes | Primary key, max 50 chars. Also used as the EventBridge scheduler name. |
 | `pmsProvider` | string | yes | PMS name — e.g. `"Opera"`, `"Mews"`, `"Apaleo"` |
-| `config.name` | string | yes | EventBridge scheduler name — must be unique within the scheduler group |
-| `config.timezone` | string | yes | IANA timezone — e.g. `"Asia/Kolkata"`, `"America/New_York"`, `"Europe/London"` |
-| `config.cron` | string | yes | Full EventBridge cron expression (see examples below) |
-| `config.enabled` | bool | no | `true` to activate the scheduler, `false` to create it disabled. Defaults to `false` if omitted |
+| `config` | object | no | Arbitrary JSON metadata for non-schedule data. Stored in tenant_config. |
+| `expression` | string | yes | Full EventBridge expression — e.g. `"cron(0 7 * * ? *)"` or `"rate(1 hour)"` |
+| `timezone` | string | yes | IANA timezone — e.g. `"Asia/Kolkata"`, `"America/New_York"` |
+| `enabled` | bool | no | `true` to activate immediately. Defaults to `false` if omitted. |
 
 **Cron expression format**
 
-EventBridge uses a 6-field cron: `cron(minutes hours day-of-month month day-of-week year)`.
-Use `*` for "every", `?` as a placeholder for day-of-month or day-of-week (one must be `?`).
-
-| Run time | Cron expression |
-|----------|----------------|
+| Run time | Expression |
+|----------|-----------|
 | Every day at 07:00 | `cron(0 7 * * ? *)` |
 | Every day at 08:30 | `cron(30 8 * * ? *)` |
 | Every day at 18:00 | `cron(0 18 * * ? *)` |
 | Every hour | `rate(1 hour)` |
 | Every 30 minutes | `rate(30 minutes)` |
 
-The `config.timezone` field is applied by EventBridge automatically — no UTC conversion needed.
-
 **201 Created**
 ```json
 {
   "tenantId":    "tenant-001",
   "pmsProvider": "Opera",
-  "config": {
-    "name":     "tenant-001-run",
-    "timezone": "Asia/Kolkata",
-    "cron":     "cron(0 7 * * ? *)",
-    "enabled":  true
-  },
-  "createdAt": "0001-01-01T00:00:00Z",
-  "updatedAt": "0001-01-01T00:00:00Z"
+  "config":      { "name": "Grand Hotel", "hotelCode": "GH001" },
+  "schedule": {
+    "expression": "cron(0 7 * * ? *)",
+    "timezone":   "Asia/Kolkata",
+    "state":      "ENABLED"
+  }
 }
 ```
 
-**400 Bad Request** — missing required field
+**400 Bad Request**
 ```json
 { "error": "tenantId is required" }
 { "error": "pmsProvider is required" }
-{ "error": "config.name is required" }
-{ "error": "config.timezone is required" }
-{ "error": "config.cron is required" }
+{ "error": "expression is required" }
+{ "error": "timezone is required" }
 ```
 
-**500 Internal Server Error** — EventBridge or DB failure
+**500 Internal Server Error**
 ```json
 { "error": "scheduler: ..." }
 ```
@@ -249,11 +243,28 @@ The `config.timezone` field is applied by EventBridge automatically — no UTC c
 
 ### GET /tenants/{id}
 
+Returns tenant + config from DB and live schedule from EventBridge.
+
 ```bash
 curl $BASE_URL/tenants/tenant-001
 ```
 
-**200 OK** — same shape as a single element from `GET /tenants`.
+**200 OK**
+```json
+{
+  "tenantId":    "tenant-001",
+  "pmsProvider": "Opera",
+  "config":      { "name": "Grand Hotel", "hotelCode": "GH001" },
+  "schedule": {
+    "expression": "cron(0 7 * * ? *)",
+    "timezone":   "Asia/Kolkata",
+    "state":      "ENABLED"
+  },
+  "createdAt": "2026-06-29T10:00:00Z"
+}
+```
+
+`schedule` is `null` if no EventBridge scheduler exists for this tenant.
 
 **404 Not Found**
 ```json
@@ -262,41 +273,53 @@ curl $BASE_URL/tenants/tenant-001
 
 ---
 
+### PUT /tenants/{id}/schedule
+
+Updates the EventBridge Scheduler **only** — no database write. DB is checked first to confirm the tenant exists.
+
+```bash
+curl -X PUT $BASE_URL/tenants/tenant-001/schedule \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expression": "cron(30 8 * * ? *)",
+    "timezone":   "Asia/Kolkata",
+    "enabled":    true
+  }'
+```
+
+Setting `enabled: false` disables the scheduler without deleting it.
+
+**200 OK** `{ "status": "updated" }`
+
+**400 Bad Request** `{ "error": "expression is required" }` / `"timezone is required"`
+
+**404 Not Found** `{ "error": "tenant not found" }`
+
+**500 Internal Server Error** `{ "error": "scheduler: ..." }`
+
+---
+
 ### PUT /tenants/{id}/config
 
-Replaces the config JSON and updates the EventBridge Scheduler. Scheduler is updated first. If `config.name` changes, the old scheduler is deleted after the new one is created.
+Replaces the tenant_config JSONB. **No EventBridge call.** DB is checked first to confirm the tenant exists.
+
+Do **not** include schedule fields (`expression`, `timezone`, `enabled`) in the config object.
 
 ```bash
 curl -X PUT $BASE_URL/tenants/tenant-001/config \
   -H "Content-Type: application/json" \
   -d '{
-    "config": {
-      "name": "tenant-001-run",
-      "timezone": "Asia/Kolkata",
-      "cron": "cron(30 8 * * ? *)",
-      "enabled": false
-    }
+    "config": { "name": "Grand Hotel Updated", "hotelCode": "GH001", "region": "APAC" }
   }'
 ```
 
-Setting `enabled: false` disables the EventBridge scheduler without deleting it.
+**200 OK** `{ "status": "updated" }`
 
-**200 OK**
-```json
-{ "status": "updated" }
-```
+**400 Bad Request** `{ "error": "config is required" }`
 
-**400 Bad Request** — same field errors as POST.
+**404 Not Found** `{ "error": "tenant not found" }`
 
-**404 Not Found**
-```json
-{ "error": "tenant not found" }
-```
-
-**500 Internal Server Error**
-```json
-{ "error": "scheduler: ..." }
-```
+**500 Internal Server Error** `{ "error": "..." }`
 
 ---
 
@@ -308,25 +331,8 @@ Deletes the tenant row (cascades to tenant_config), then deletes the EventBridge
 curl -X DELETE $BASE_URL/tenants/tenant-001
 ```
 
-**200 OK**
-```json
-{ "status": "deleted" }
-```
+**200 OK** `{ "status": "deleted" }`
 
-**404 Not Found**
-```json
-{ "error": "tenant not found" }
-```
+**404 Not Found** `{ "error": "tenant not found" }`
 
-**500 Internal Server Error**
-```json
-{ "error": "delete scheduler: ..." }
-```
-
----
-
-## Terraform ownership
-
-Terraform manages: Scheduler Group, both Lambdas, SQS + DLQ, IAM roles, API Gateway, CloudWatch log groups, RDS.
-
-Terraform does **not** manage individual tenant schedulers. Those are created dynamically by the API Lambda at runtime and named after `config.name`.
+**500 Internal Server Error** `{ "error": "delete scheduler: ..." }`

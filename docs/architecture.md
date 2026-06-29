@@ -23,20 +23,19 @@
 
 This system schedules a recurring job for each PMS tenant. Each tenant has:
 
-- A **PMS provider** (e.g. Opera, Mews, Apaleo)
-- A **schedule config** stored as JSON in RDS — containing a name, timezone, cron expression, and enabled flag
+- A **PMS provider** (e.g. Opera, Mews, Apaleo) — stored in RDS
+- A **config** (arbitrary non-schedule metadata: hotel name, codes, etc.) — stored as JSONB in RDS
+- A **schedule** (cron expression, timezone, enabled state) — stored **only in EventBridge**, never in the database
 
 At the scheduled time, AWS fires a Lambda function for that specific tenant. The Lambda reads the tenant record from RDS and pushes a JSON payload to an SQS queue for downstream consumers.
 
-The system supports any number of tenants across any timezones, all from a single AWS deployment, with no shared state between tenants at execution time.
+**EventBridge is the source of truth for schedules. RDS is the source of truth for tenant identity and metadata.**
 
 ---
 
 ## 2. The Core Problem It Solves
 
 ### The naive approach (what this system avoids)
-
-A common but expensive pattern is a "polling scheduler":
 
 ```
 Every 1 minute:
@@ -45,82 +44,68 @@ Every 1 minute:
     do work
 ```
 
-Problems with this:
-- Lambda runs 1440 times per day just to check if anything needs to run
-- Clock drift can cause missed or double-fires
-- DST changes require application-level timezone math
-- Hard to scale to hundreds of tenants
+Problems: Lambda runs 1440×/day doing nothing, DST requires app-level math, hard to scale.
 
 ### This system's approach
 
-One **EventBridge Scheduler per tenant** — a managed AWS resource that fires exactly once per day at the correct local time, with AWS handling all timezone and DST calculations automatically.
+One **EventBridge Scheduler per tenant** — fires exactly at the right local time, AWS handles DST automatically, no polling.
 
 ```
 EventBridge fires at exactly 07:00 Asia/Kolkata
       ↓
 Trigger Lambda receives {"tenantId": "tenant-001"}
       ↓
-Lambda knows exactly who triggered it — no polling needed
+Lambda knows exactly who to run for — no polling, no scanning
 ```
 
 ---
 
 ## 3. System Architecture
 
-### High-level diagram
-
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Client (PMS UI / curl)                                             │
+│  Client (curl / PMS UI)                                             │
 └──────────────────────┬──────────────────────────────────────────────┘
                        │ HTTPS
                        ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  API Gateway (HTTP API v2)                                          │
 │  POST   /tenants                                                    │
-│  PUT    /tenants/{id}/config                                        │
 │  GET    /tenants  /tenants/{id}                                     │
+│  PUT    /tenants/{id}/schedule   PUT /tenants/{id}/config           │
 │  DELETE /tenants/{id}                                               │
 └──────────────────────┬──────────────────────────────────────────────┘
-                       │ Lambda Proxy Integration
+                       │ Lambda Proxy
                        ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  API Lambda (Go)                                                    │
-│  - Reads / writes RDS tenant + tenant_config tables                 │
-│  - Creates / updates / deletes EventBridge Schedulers               │
-└──────────┬────────────────────────────┬────────────────────────────┘
-           │                            │
-           ▼                            ▼
-┌─────────────────────┐    ┌────────────────────────────────────────┐
-│  RDS PostgreSQL      │    │  EventBridge Scheduler Group           │
-│  tenant              │    │  "pms-schedulers"                      │
-│  tenant_config       │    │                                        │
-│                      │    │  ├── tenant-001-run                    │
-│  tenant-001          │    │  │   cron(0 7 * * ? *)                 │
-│  tenant-002          │    │  │   timezone: Asia/Kolkata            │
-│  tenant-003 ...      │    │  │   payload: {"tenantId":"tenant-001"}│
-└─────────────────────┘    └──────────────┬─────────────────────────┘
-                                           │ Fires at scheduled local time
-   SOURCE OF TRUTH                         ▼
-   Schedulers are            ┌──────────────────────────────┐
-   derived from              │  Trigger Lambda (Go)         │
-   these tables              │  Input: {"tenantId":"tenant-001"} │
-                             │                              │
+│  - DB: tenant identity (pms_provider) + config JSONB metadata       │
+│  - EventBridge: schedule CRUD + live reads via GetSchedule          │
+└──────────┬───────────────────────────────┬─────────────────────────┘
+           │                               │
+           ▼                               ▼
+┌──────────────────────┐    ┌──────────────────────────────────────────┐
+│  RDS PostgreSQL       │    │  EventBridge Scheduler Group             │
+│  single tenant table  │    │  "pms-schedulers"                        │
+│                       │    │                                          │
+│  tenant_id  Opera     │    │  ├── tenant-001                          │
+│  config: {name:...}   │    │  │   cron(0 7 * * ? *) Asia/Kolkata      │
+│                       │    │  │   {"tenantId":"tenant-001"}           │
+│  NO schedule fields   │    │  ├── tenant-002                          │
+│  Schedule lives only  │    │  │   cron(0 9 * * ? *) America/New_York  │
+│  in EventBridge       │    │                                          │
+└──────────────────────┘    └──────────────┬───────────────────────────┘
+                                            │ Fires at scheduled local time
+                                            ▼
+                             ┌──────────────────────────────┐
+                             │  Trigger Lambda              │
+                             │  {"tenantId":"tenant-001"}   │
                              │  1. Load tenant from RDS     │
-                             │  2. Build JSON payload       │
-                             │  3. Push to SQS              │
+                             │  2. Push payload to SQS      │
                              └──────────────┬───────────────┘
-                                            │
                                             ▼
                              ┌──────────────────────────────┐
-                             │  SQS Queue (pms-queue)       │
-                             │  + Dead Letter Queue (DLQ)   │
-                             └──────────────────────────────┘
-                                            │
-                                            ▼
-                             ┌──────────────────────────────┐
-                             │  Downstream Consumers        │
-                             │  (any SQS subscriber)        │
+                             │  SQS Queue + DLQ             │
                              └──────────────────────────────┘
 ```
 
@@ -128,15 +113,15 @@ Lambda knows exactly who triggered it — no polling needed
 
 | Component | Managed by | Purpose |
 |-----------|-----------|---------|
-| RDS PostgreSQL | Terraform | Source of truth for tenant + config |
+| RDS PostgreSQL | Terraform | Tenant identity + non-schedule config JSONB |
 | EventBridge Scheduler Group | Terraform | Container for all tenant schedulers |
-| Individual tenant schedulers | Application (API Lambda) | One per tenant, fires at their local time |
-| API Lambda | Terraform + Go build | CRUD API + scheduler management |
-| Trigger Lambda | Terraform + Go build | Invoked by EventBridge; pushes payload to SQS |
-| SQS Queue | Terraform | Async delivery to downstream consumers |
-| SQS DLQ | Terraform | Catches messages that fail 3 delivery attempts |
+| Pre-defined tenant schedulers | Terraform (`ignore_changes = all`) | Created once, then owned by the application |
+| Dynamic tenant schedulers | API Lambda at runtime | Created by `POST /tenants` |
+| API Lambda | Terraform + Go build | CRUD API + EventBridge calls |
+| Trigger Lambda | Terraform + Go build | Invoked by EventBridge; pushes to SQS |
+| SQS Queue + DLQ | Terraform | Async delivery to downstream consumers |
 | API Gateway (HTTP v2) | Terraform | Routes HTTP requests to API Lambda |
-| IAM Roles | Terraform | Least-privilege access for each component |
+| IAM Roles | Terraform | Least-privilege per component |
 
 ---
 
@@ -144,157 +129,102 @@ Lambda knows exactly who triggered it — no polling needed
 
 ### Tenant isolation
 
-Each tenant is completely isolated at the scheduler level. There is **one EventBridge Scheduler per tenant**, not a single shared scheduler that loops through all tenants.
+One EventBridge Scheduler per tenant. Each fires independently at its own local time.
 
 ```
-AWS Account
-└── EventBridge Scheduler Group: pms-schedulers
-    ├── tenant-001-run   → fires 07:00 Asia/Kolkata
-    ├── tenant-002-run   → fires 09:00 America/New_York
-    ├── tenant-003-run   → fires 18:00 Europe/London
-    ├── tenant-004-run   → fires 06:00 Asia/Tokyo
-    └── ...
+pms-schedulers group
+  ├── tenant-001  →  cron(0 7 * * ? *)  Asia/Kolkata
+  ├── tenant-002  →  cron(0 9 * * ? *)  America/New_York
+  ├── tenant-003  →  cron(0 18 * * ? *) Europe/London
+  └── ...
 ```
 
-When `tenant-001`'s scheduler fires, the Lambda receives:
-
-```json
-{ "tenantId": "tenant-001" }
-```
-
-The Lambda immediately knows which tenant it is working for. No database scan, no polling, no iteration over all tenants.
+The Lambda receives `{"tenantId":"tenant-001"}` — no scanning or polling.
 
 ### Database schema
 
+One table — `config` JSONB sits alongside tenant identity. Schedule details are not stored here.
+
 ```sql
--- Parent: one row per tenant
 CREATE TABLE tenant (
     tenant_id    VARCHAR(50)  PRIMARY KEY,
     pms_provider VARCHAR(100) NOT NULL,
-    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-
--- Config: JSONB blob keyed by tenant, cascades on delete
-CREATE TABLE tenant_config (
-    tenant_id  VARCHAR(50) PRIMARY KEY REFERENCES tenant(tenant_id) ON DELETE CASCADE,
-    config     JSONB       NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    config       JSONB        NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 ```
 
-`config` JSONB shape:
+`config` JSONB holds arbitrary non-schedule metadata (hotel name, codes, etc.). It does **not** store schedule fields like cron expression, timezone, or enabled state — those live only in EventBridge.
 
-```json
-{
-  "name":     "tenant-001-run",
-  "timezone": "Asia/Kolkata",
-  "cron":     "cron(0 7 * * ? *)",
-  "enabled":  true
-}
-```
+### Scheduler naming
 
-`config.name` is used as the EventBridge scheduler name. It must be unique within the scheduler group.
+The EventBridge scheduler name equals the `tenantId` exactly (e.g. `tenant-001`). This is deterministic — the API always knows the scheduler name from the tenant ID alone, with no lookup needed.
 
-### Why RDS is the source of truth
+### Sources of truth
 
-The EventBridge Scheduler is a **derived resource**. If it gets deleted (accidentally, by Terraform, or during an AWS incident), the data to recreate it is always in RDS:
-
-```sql
-SELECT t.tenant_id, tc.config
-FROM tenant t
-JOIN tenant_config tc ON t.tenant_id = tc.tenant_id
-WHERE tc.config->>'enabled' = 'true';
-```
-
-A recovery script can loop over these rows and call `PUT /tenants/{id}/config` to recreate all schedulers.
+| Data | Source of truth |
+|------|----------------|
+| Tenant identity (`pms_provider`) + non-schedule metadata (`config`) | RDS `tenant` table |
+| Schedule (`expression`, `timezone`, `state`) | EventBridge Scheduler |
 
 ### Tenant lifecycle
 
 ```
-Create tenant                  Update config                 Delete tenant
-─────────────                  ─────────────                 ─────────────
-POST /tenants                  PUT /tenants/{id}/config      DELETE /tenants/{id}
+Create                         Update schedule               Delete
+──────                         ───────────────               ──────
+POST /tenants                  PUT /tenants/{id}/schedule    DELETE /tenants/{id}
     │                              │                              │
-    ├─ EventBridge Upsert          ├─ EventBridge Upsert          ├─ DELETE from RDS
-    │  (schedule first)            │  (schedule first)            │  (cascades to config)
-    │                              │                              │
-    └─ INSERT into RDS             └─ UPDATE tenant_config        └─ EventBridge Delete
-       tenant + tenant_config
+    ├─ EventBridge Upsert          ├─ EventBridge Upsert          ├─ DB delete
+    │  (schedule first)            │  (EventBridge ONLY           │
+    └─ DB insert                   │   no DB write)               └─ EventBridge delete
 ```
 
-**Schedule is always created/updated before the DB write.** On DB failure, the scheduler is deleted as a best-effort rollback.
+### Terraform-owned vs API-owned schedulers
+
+Schedulers defined in `terraform/scheduler.tf` use `lifecycle { ignore_changes = all }`:
+
+```hcl
+resource "aws_scheduler_schedule" "tenant_001" {
+  name       = "tenant-001"
+  ...
+  lifecycle { ignore_changes = all }
+}
+```
+
+- **First `terraform apply`**: creates the scheduler
+- **Every subsequent `terraform apply`**: skips it entirely — Terraform reads the state but makes no changes
+- **API Lambda**: can freely modify or delete it; Terraform will never revert those changes
+
+Schedulers created via `POST /tenants` at runtime are never in Terraform state — they are purely application-managed.
 
 ---
 
 ## 5. How Scheduling Works
 
-Each tenant's `config.cron` is passed directly to EventBridge as the schedule expression. There is no server-side conversion.
+Each tenant's `expression` is passed directly to EventBridge. There is no server-side conversion.
 
 ### Cron expression format
 
-EventBridge uses a 6-field cron: `cron(minutes hours day-of-month month day-of-week year)`.
+EventBridge: `cron(minutes hours day-of-month month day-of-week year)`
 
-| Run time | cron expression |
-|----------|----------------|
+| Run time | Expression |
+|----------|-----------|
 | Every day at 07:00 | `cron(0 7 * * ? *)` |
-| Every day at 09:00 | `cron(0 9 * * ? *)` |
-| Every day at 07:30 | `cron(30 7 * * ? *)` |
+| Every day at 08:30 | `cron(30 8 * * ? *)` |
 | Every day at 18:00 | `cron(0 18 * * ? *)` |
 | Every hour | `rate(1 hour)` |
 | Every 30 minutes | `rate(30 minutes)` |
 
-The `?` in `day-of-week` means "no specific value" — required when `day-of-month` is `*`.
+`?` in day-of-week means "no specific value" — required when day-of-month is `*`.
 
 ### Timezone handling
 
-Every scheduler has a `ScheduleExpressionTimezone` field set from `config.timezone`. The cron expression is interpreted in that timezone — AWS handles DST transitions automatically.
+`ScheduleExpressionTimezone` is set from the `timezone` field. AWS interprets the cron in that timezone and handles DST automatically — no UTC offset math in application code.
 
-```
-Scheduler for tenant-001:
-  ScheduleExpression:         cron(0 7 * * ? *)
-  ScheduleExpressionTimezone: Asia/Kolkata
+### Reading schedule state
 
-AWS fires at 01:30 UTC, which is exactly 07:00 in Kolkata.
-```
-
-```
-America/New_York — DST example:
-  Winter (EST, UTC-5):  09:00 → 14:00 UTC
-  Summer (EDT, UTC-4):  09:00 → 13:00 UTC
-  Cron stays:           cron(0 9 * * ? *)   — AWS adjusts automatically
-```
-
-### The upsert pattern in code
-
-```go
-// internal/scheduler/scheduler.go — Upsert()
-
-// Try to update first (fast path — scheduler already exists)
-_, err := client.UpdateSchedule(ctx, updateInput)
-if err == nil {
-    return nil // done
-}
-
-// Only create if the scheduler doesn't exist yet
-var notFound *types.ResourceNotFoundException
-if !errors.As(err, &notFound) {
-    return fmt.Errorf("update scheduler: %w", err) // real error
-}
-
-// Scheduler didn't exist — create it
-_, err = client.CreateSchedule(ctx, createInput)
-```
-
-This avoids a `GetSchedule` round-trip. Update is tried first because updating an existing scheduler is more common than creating a new one.
-
-### Schedule name changes
-
-If `config.name` changes on a `PUT /tenants/{id}/config`:
-1. The new scheduler is upserted under the new name
-2. The old scheduler is deleted by its old name
-
-This keeps EventBridge clean — no orphaned schedulers.
+`GET /tenants/{id}` calls `scheduler.Get()` which calls `GetSchedule` on EventBridge and returns the live expression, timezone, and state. This is always accurate — there is no cached or stale copy in the DB.
 
 ---
 
@@ -302,110 +232,67 @@ This keeps EventBridge clean — no orphaned schedulers.
 
 ### API Lambda (`lambdas/api/main.go`)
 
-Handles all HTTP routes. The key responsibility beyond basic CRUD is keeping the EventBridge Scheduler in sync with every DB write, with the **scheduler updated first**:
+| Route | DB | EventBridge |
+|-------|-----|-------------|
+| `GET /tenants` | `ListTenants` | — |
+| `POST /tenants` | `CreateTenant` (single INSERT, after) | `Upsert` (first) |
+| `GET /tenants/{id}` | `GetTenant` | `Get` (live read) |
+| `PUT /tenants/{id}/schedule` | `GetTenant` (existence check only) | `Upsert` |
+| `PUT /tenants/{id}/config` | `UpdateConfig` (UPDATE tenant SET config) | — |
+| `DELETE /tenants/{id}` | `DeleteTenant` | `Delete` (after) |
 
-```
-POST   /tenants              → sched.Upsert()  then  db.CreateTenant()
-PUT    /tenants/{id}/config  → sched.Upsert()  then  db.UpdateTenantConfig()
-DELETE /tenants/{id}         → db.GetTenant()  then  db.DeleteTenant()  then  sched.Delete()
-```
+Key: `PUT /tenants/{id}/schedule` makes **zero DB writes**. `PUT /tenants/{id}/config` makes **zero EventBridge calls**. These are fully separate operations.
 
-On cold start (`init()`), it connects to RDS and runs the migration — idempotent, safe on every cold start.
-
-Routing is done manually by splitting the URL path:
-
-```go
-path := strings.TrimRight(req.RequestContext.HTTP.Path, "/")
-parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
-// parts[0] = "tenants", parts[1] = tenantID, parts[2] = "config"
-```
+On cold start (`init()`): connects to RDS, runs migration (drops legacy `tenant_config` if present, creates `tenant` if absent).
 
 ### Trigger Lambda (`lambdas/trigger/main.go`)
 
-The target of every EventBridge Scheduler. Receives a minimal event:
+Receives `{"tenantId":"tenant-001"}` from EventBridge.
 
-```json
-{ "tenantId": "tenant-001" }
-```
+1. `db.GetTenant(tenantID)` — loads `pmsProvider` from RDS.
+2. Builds SQS payload: `{ tenantId, pmsProvider, executedAt }`.
+3. `sqsClient.SendMessage()` — pushes to `pms-queue`.
 
-Execution flow:
-
-```
-1. db.GetTenant("tenant-001")
-      ↓
-   Returns: { pmsProvider: "Opera", config: { name: "...", timezone: "...", ... } }
-
-2. Build SQS payload:
-   {
-     "tenantId":    "tenant-001",
-     "pmsProvider": "Opera",
-     "executedAt":  "2026-06-29T01:30:00Z"
-   }
-
-3. sqsClient.SendMessage() with MessageAttribute tenantId="tenant-001"
-```
-
-In a production PMS system, step 2 would call the PMS provider's API (e.g. OHIP) before pushing to SQS.
+The trigger Lambda never reads schedule data — it only needs to know *who* triggered it.
 
 ### Scheduler package (`internal/scheduler/scheduler.go`)
 
-Two exported functions:
+| Function | What it does |
+|----------|-------------|
+| `Get(tenantID)` | Calls `GetSchedule` → returns live `ScheduleInfo` or `nil` if not found |
+| `Upsert(tenantID, expression, timezone, enabled)` | `UpdateSchedule` → fallback to `CreateSchedule` on 404 |
+| `Delete(tenantID)` | `DeleteSchedule` — idempotent (ignores 404) |
 
-| Function | When called | What it does |
-|----------|------------|--------------|
-| `Upsert(name, timezone, cronExpr, tenantID, enabled)` | Create or update config | UpdateSchedule → if 404, CreateSchedule. `enabled` sets `State=ENABLED` or `State=DISABLED`. |
-| `Delete(name)` | Delete tenant | DeleteSchedule by name (safe if already gone) |
-
-`Upsert` takes the scheduler name directly from `config.name`. The cron expression is passed through as-is — no conversion happens in application code.
+Scheduler name is always derived as `schedulerName(tenantID) = tenantID`. No name is stored anywhere.
 
 ### DB package (`internal/db/db.go`)
 
-Uses `pgx/v5/stdlib` — the modern PostgreSQL driver for Go. The `database/sql` standard interface is used so the rest of the code has no pgx dependency.
-
-`CreateTenant` wraps both inserts (`tenant` + `tenant_config`) in a transaction so either both succeed or neither does.
-
-Connection is established once per Lambda container (in `init()`). Lambda reuses the same container across warm invocations, so the connection is pooled effectively without a connection pooler.
+Single `tenant` table with a `config` JSONB column. Functions: `Connect`, `Ping`, `Migrate`, `CreateTenant` (single INSERT), `GetTenant`, `ListTenants`, `UpdateConfig` (UPDATE tenant SET config), `DeleteTenant`. No joins, no secondary table.
 
 ---
 
 ## 7. IAM & Security Model
 
-Three IAM roles are created by Terraform:
-
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ pms-api-lambda-role                                             │
-│   Assumed by: lambda.amazonaws.com                              │
-│   Permissions:                                                  │
-│     - logs:* (CloudWatch)                                       │
-│     - scheduler:CreateSchedule                                  │
-│     - scheduler:UpdateSchedule                                  │
-│     - scheduler:DeleteSchedule                                  │
-│     - scheduler:GetSchedule                                     │
-│     - scheduler:ListSchedules                                   │
-│     - iam:PassRole → pms-scheduler-execution-role only          │
-└─────────────────────────────────────────────────────────────────┘
+pms-api-lambda-role          (assumed by API Lambda)
+  scheduler:CreateSchedule
+  scheduler:UpdateSchedule
+  scheduler:GetSchedule
+  scheduler:DeleteSchedule
+  scheduler:ListSchedules
+  iam:PassRole → pms-scheduler-execution-role only
+  logs:*
 
-┌─────────────────────────────────────────────────────────────────┐
-│ pms-trigger-lambda-role                                         │
-│   Assumed by: lambda.amazonaws.com                              │
-│   Permissions:                                                  │
-│     - logs:* (CloudWatch)                                       │
-│     - sqs:SendMessage → pms-queue only                          │
-│     - sqs:GetQueueAttributes → pms-queue only                   │
-└─────────────────────────────────────────────────────────────────┘
+pms-scheduler-execution-role  (assumed by EventBridge at fire time)
+  lambda:InvokeFunction → pms-trigger ARN only
 
-┌─────────────────────────────────────────────────────────────────┐
-│ pms-scheduler-execution-role                                    │
-│   Assumed by: scheduler.amazonaws.com                           │
-│   Permissions:                                                  │
-│     - lambda:InvokeFunction → pms-trigger Lambda only           │
-└─────────────────────────────────────────────────────────────────┘
+pms-trigger-lambda-role       (assumed by Trigger Lambda)
+  sqs:SendMessage → pms-queue ARN only
+  sqs:GetQueueAttributes
+  logs:*
 ```
 
-### Why `iam:PassRole` is required
-
-When the API Lambda calls `CreateSchedule`, it must specify a `RoleArn` that EventBridge will assume when the schedule fires. AWS enforces that the caller has `iam:PassRole` on that specific role. Without this, `CreateSchedule` returns `AccessDenied`.
+`iam:PassRole` is required because when the API Lambda calls `CreateSchedule` it hands EventBridge a role ARN to assume at fire time. AWS enforces the caller holds `PassRole` on that role.
 
 ---
 
@@ -415,145 +302,126 @@ When the API Lambda calls `CreateSchedule`, it must specify a `RoleArn` that Eve
 
 ```
 POST /tenants
-{
-  "tenantId":    "tenant-001",
-  "pmsProvider": "Opera",
-  "config": {
-    "name":     "tenant-001-run",
-    "timezone": "Asia/Kolkata",
-    "cron":     "cron(0 7 * * ? *)",
-    "enabled":  true
-  }
-}
+{ "tenantId": "tenant-001", "pmsProvider": "Opera",
+  "config": { "name": "Grand Hotel", "hotelCode": "GH001" },
+  "expression": "cron(0 7 * * ? *)", "timezone": "Asia/Kolkata", "enabled": true }
          │
          ▼
 API Lambda
-  ├── sched.Upsert("tenant-001-run", "Asia/Kolkata", "cron(0 7 * * ? *)", "tenant-001", true)
-  │     ├── Try UpdateSchedule → 404 ResourceNotFoundException
-  │     └── CreateSchedule
-  │           Name:       "tenant-001-run"
-  │           GroupName:  "pms-schedulers"
-  │           Expression: "cron(0 7 * * ? *)"
-  │           Timezone:   "Asia/Kolkata"
-  │           Target:     pms-trigger Lambda
-  │           Input:      {"tenantId":"tenant-001"}
+  ├── sched.Upsert("tenant-001", "cron(0 7 * * ? *)", "Asia/Kolkata", true)
+  │     → CreateSchedule "tenant-001" in pms-schedulers group
   │
   └── db.CreateTenant("tenant-001", "Opera", config)  [transaction]
-        INSERT INTO tenant (tenant_id, pms_provider) VALUES (...)
-        INSERT INTO tenant_config (tenant_id, config) VALUES (...)
-         │
-         ▼
-Response: HTTP 201
-{
-  "tenantId":    "tenant-001",
-  "pmsProvider": "Opera",
-  "config": { "name": "tenant-001-run", "timezone": "Asia/Kolkata", ... }
-}
+        → INSERT INTO tenant VALUES (...)
+        → INSERT INTO tenant_config VALUES (...)
+
+Response 201:
+{ "tenantId":"tenant-001", "pmsProvider":"Opera",
+  "config":{"name":"Grand Hotel","hotelCode":"GH001"},
+  "schedule":{"expression":"cron(0 7 * * ? *)","timezone":"Asia/Kolkata","state":"ENABLED"} }
 ```
 
-### Flow B: Tenant changes their schedule
+### Flow B: Reading a tenant
 
 ```
-PUT /tenants/tenant-001/config
-{
-  "config": {
-    "name":     "tenant-001-run",
-    "timezone": "Asia/Kolkata",
-    "cron":     "cron(30 9 * * ? *)",
-    "enabled":  true
-  }
-}
+GET /tenants/tenant-001
          │
          ▼
 API Lambda
-  ├── db.GetTenant("tenant-001")  ← fetch old name to detect renames
-  │     oldName = "tenant-001-run"
+  ├── db.GetTenant("tenant-001")
+  │     → SELECT t.*, tc.config FROM tenant t LEFT JOIN tenant_config tc ...
   │
-  ├── sched.Upsert("tenant-001-run", "Asia/Kolkata", "cron(30 9 * * ? *)", "tenant-001", true)
-  │     └── UpdateSchedule (name unchanged, expression changed)
-  │
-  └── db.UpdateTenantConfig("tenant-001", newConfig)
-         │
-         ▼
-Response: HTTP 200 { "status": "updated" }
+  └── sched.Get("tenant-001")
+        → GetSchedule "tenant-001" from EventBridge (live, always current)
 
-No Terraform changes. No deployment. Effective immediately.
+Response 200:
+{ "tenantId":"tenant-001", "pmsProvider":"Opera",
+  "config":{"name":"Grand Hotel","hotelCode":"GH001"},
+  "schedule":{"expression":"cron(0 7 * * ? *)","timezone":"Asia/Kolkata","state":"ENABLED"},
+  "createdAt":"2026-06-29T10:00:00Z" }
 ```
 
-### Flow C: Scheduled execution fires
+### Flow C: Updating a schedule
 
 ```
-Clock reaches 09:30 Asia/Kolkata (= 04:00 UTC)
-         │
-         ▼
-EventBridge Scheduler "tenant-001-run" fires
-         │  Assumes pms-scheduler-execution-role
-         │  Invokes pms-trigger Lambda
-         ▼
-Trigger Lambda receives:
-{ "tenantId": "tenant-001" }
-         │
-         ▼
-db.GetTenant("tenant-001")
-→ { pmsProvider: "Opera", config: { name: "tenant-001-run", ... } }
-         │
-         ▼
-Build payload:
-{
-  "tenantId":    "tenant-001",
-  "pmsProvider": "Opera",
-  "executedAt":  "2026-06-29T04:00:00Z"
-}
-         │
-         ▼
-SQS SendMessage → pms-queue
-  MessageAttribute: tenantId = "tenant-001"
-         │
-         ▼
-Downstream consumer receives and processes the message
-```
-
-### Flow D: Disabling a tenant
-
-```
-PUT /tenants/tenant-001/config
-{
-  "config": {
-    "name":     "tenant-001-run",
-    "timezone": "Asia/Kolkata",
-    "cron":     "cron(0 7 * * ? *)",
-    "enabled":  false
-  }
-}
+PUT /tenants/tenant-001/schedule
+{ "expression": "cron(30 9 * * ? *)", "timezone": "Asia/Kolkata", "enabled": true }
          │
          ▼
 API Lambda
-  └── sched.Upsert(..., enabled=false)
-        └── UpdateSchedule with State=DISABLED
-              scheduler still exists, just paused
+  ├── db.GetTenant("tenant-001")  ← existence check only
+  │
+  └── sched.Upsert("tenant-001", "cron(30 9 * * ? *)", "Asia/Kolkata", true)
+        → UpdateSchedule "tenant-001"  (NO DB WRITE)
+
+Response 200: { "status": "updated" }
 ```
 
-### Flow E: Deleting a tenant
+No DB row is written. The new schedule lives only in EventBridge.
+
+### Flow C2: Updating tenant metadata
+
+```
+PUT /tenants/tenant-001/config
+{ "config": { "name": "Grand Hotel Updated", "hotelCode": "GH001", "region": "APAC" } }
+         │
+         ▼
+API Lambda
+  ├── db.GetTenant("tenant-001")  ← existence check only
+  │
+  └── db.UpdateConfig("tenant-001", config)
+        → INSERT INTO tenant_config ... ON CONFLICT DO UPDATE  (NO EVENTBRIDGE CALL)
+
+Response 200: { "status": "updated" }
+```
+
+No EventBridge call is made. The schedule is untouched.
+
+### Flow D: Scheduled execution fires
+
+```
+Clock reaches 09:30 Asia/Kolkata
+         │
+         ▼
+EventBridge Scheduler "tenant-001" fires
+  Assumes pms-scheduler-execution-role
+  Invokes pms-trigger Lambda with {"tenantId":"tenant-001"}
+         │
+         ▼
+Trigger Lambda
+  ├── db.GetTenant("tenant-001")  → { pmsProvider: "Opera" }
+  └── sqsClient.SendMessage → { tenantId, pmsProvider, executedAt }
+```
+
+### Flow E: Disabling a tenant
+
+```
+PUT /tenants/tenant-001/schedule
+{ "expression": "cron(0 7 * * ? *)", "timezone": "Asia/Kolkata", "enabled": false }
+         │
+         ▼
+sched.Upsert(..., enabled=false)
+  → UpdateSchedule with State=DISABLED
+    Scheduler exists but won't fire.  No DB change.
+```
+
+### Flow F: Deleting a tenant
 
 ```
 DELETE /tenants/tenant-001
          │
          ▼
 API Lambda
-  ├── db.GetTenant("tenant-001")   ← fetch config.name for scheduler name
-  ├── db.DeleteTenant("tenant-001") ← cascades to tenant_config
-  └── sched.Delete("tenant-001-run") ← removes EventBridge scheduler
+  ├── db.GetTenant("tenant-001")       ← verify exists
+  ├── db.DeleteTenant("tenant-001")    ← remove from RDS; cascades to tenant_config
+  └── sched.Delete("tenant-001")       ← remove from EventBridge
 ```
 
 ---
 
 ## 9. API Reference
 
-Base URL: `https://{api-id}.execute-api.{region}.amazonaws.com`
-
-Get it after deployment: `terraform output api_endpoint`
-
-Set it as a variable for the curl examples below:
+Base URL: `terraform output api_endpoint`
 
 ```bash
 export BASE_URL=https://abc123.execute-api.us-east-1.amazonaws.com
@@ -567,19 +435,13 @@ export BASE_URL=https://abc123.execute-api.us-east-1.amazonaws.com
 curl $BASE_URL/health
 ```
 
-**200 OK**
-```json
-{ "status": "ok" }
-```
-
-**503 Service Unavailable**
-```json
-{ "error": "database unavailable" }
-```
+**200 OK** `{ "status": "ok" }` | **503** `{ "error": "database unavailable" }`
 
 ---
 
 ### GET /tenants
+
+Returns tenant identity + config from DB. No schedule details (avoids N calls to EventBridge). Call `GET /tenants/{id}` for schedule info.
 
 ```bash
 curl $BASE_URL/tenants
@@ -588,18 +450,8 @@ curl $BASE_URL/tenants
 **200 OK**
 ```json
 [
-  {
-    "tenantId":    "tenant-001",
-    "pmsProvider": "Opera",
-    "config": {
-      "name":     "tenant-001-run",
-      "timezone": "Asia/Kolkata",
-      "cron":     "cron(0 7 * * ? *)",
-      "enabled":  true
-    },
-    "createdAt": "2026-06-29T10:00:00Z",
-    "updatedAt": "2026-06-29T10:00:00Z"
-  }
+  { "tenantId": "tenant-001", "pmsProvider": "Opera", "config": { "name": "Grand Hotel" }, "createdAt": "2026-06-29T10:00:00Z" },
+  { "tenantId": "tenant-002", "pmsProvider": "Mews",  "config": { "name": "City Inn" },    "createdAt": "2026-06-29T10:01:00Z" }
 ]
 ```
 
@@ -609,8 +461,7 @@ Returns `[]` when no tenants exist.
 
 ### POST /tenants
 
-Creates the tenant, its config, and an EventBridge Scheduler.
-**Scheduler is created first.** If the DB write fails, the scheduler is deleted as a rollback.
+Creates the EventBridge Scheduler first, then inserts tenant + config into DB in a transaction. Rolls back the scheduler on DB failure.
 
 ```bash
 curl -X POST $BASE_URL/tenants \
@@ -618,12 +469,10 @@ curl -X POST $BASE_URL/tenants \
   -d '{
     "tenantId":    "tenant-001",
     "pmsProvider": "Opera",
-    "config": {
-      "name":     "tenant-001-run",
-      "timezone": "Asia/Kolkata",
-      "cron":     "cron(0 7 * * ? *)",
-      "enabled":  true
-    }
+    "config":      { "name": "Grand Hotel", "hotelCode": "GH001" },
+    "expression":  "cron(0 7 * * ? *)",
+    "timezone":    "Asia/Kolkata",
+    "enabled":     true
   }'
 ```
 
@@ -631,133 +480,132 @@ curl -X POST $BASE_URL/tenants \
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `tenantId` | string | yes | Primary key, max 50 chars |
-| `pmsProvider` | string | yes | PMS name — e.g. `"Opera"`, `"Mews"`, `"Apaleo"` |
-| `config.name` | string | yes | EventBridge scheduler name — must be unique within the group |
-| `config.timezone` | string | yes | IANA timezone — e.g. `"Asia/Kolkata"`, `"America/New_York"` |
-| `config.cron` | string | yes | Full EventBridge expression — e.g. `"cron(0 7 * * ? *)"` or `"rate(1 hour)"` |
-| `config.enabled` | bool | no | `true` to activate, `false` to create disabled. Defaults to `false` if omitted |
-
-> **Fields that no longer exist:** `name`, `scheduleType`, `runTime`, `rateMinutes`, `latitude`, `longitude`, `hotelCode`.
-> All schedule details are now inside the `config` object.
+| `tenantId` | string | yes | Primary key. Also used as the EventBridge scheduler name. |
+| `pmsProvider` | string | yes | PMS system — e.g. `"Opera"`, `"Mews"`, `"Apaleo"` |
+| `config` | object | no | Arbitrary non-schedule metadata stored in tenant_config. |
+| `expression` | string | yes | EventBridge cron or rate expression |
+| `timezone` | string | yes | IANA timezone — e.g. `"Asia/Kolkata"`, `"America/New_York"` |
+| `enabled` | bool | no | `true` = active immediately. Defaults to `false`. |
 
 **201 Created**
 ```json
 {
   "tenantId":    "tenant-001",
   "pmsProvider": "Opera",
-  "config": {
-    "name":     "tenant-001-run",
-    "timezone": "Asia/Kolkata",
-    "cron":     "cron(0 7 * * ? *)",
-    "enabled":  true
-  },
-  "createdAt": "0001-01-01T00:00:00Z",
-  "updatedAt": "0001-01-01T00:00:00Z"
+  "config":      { "name": "Grand Hotel", "hotelCode": "GH001" },
+  "schedule": {
+    "expression": "cron(0 7 * * ? *)",
+    "timezone":   "Asia/Kolkata",
+    "state":      "ENABLED"
+  }
 }
 ```
 
-**400 Bad Request**
-```json
-{ "error": "tenantId is required" }
-{ "error": "pmsProvider is required" }
-{ "error": "config.name is required" }
-{ "error": "config.timezone is required" }
-{ "error": "config.cron is required" }
-```
+**400** `{ "error": "tenantId is required" }` / `"pmsProvider is required"` / `"expression is required"` / `"timezone is required"`
 
-**500 Internal Server Error**
-```json
-{ "error": "scheduler: ..." }
-```
+**500** `{ "error": "scheduler: ..." }`
 
 ---
 
 ### GET /tenants/{id}
 
+Returns tenant + config from DB and live schedule from EventBridge.
+
 ```bash
 curl $BASE_URL/tenants/tenant-001
 ```
 
-**200 OK** — same shape as a single element from `GET /tenants`.
-
-**404 Not Found**
+**200 OK**
 ```json
-{ "error": "tenant not found" }
+{
+  "tenantId":    "tenant-001",
+  "pmsProvider": "Opera",
+  "config":      { "name": "Grand Hotel", "hotelCode": "GH001" },
+  "schedule": {
+    "expression": "cron(0 7 * * ? *)",
+    "timezone":   "Asia/Kolkata",
+    "state":      "ENABLED"
+  },
+  "createdAt": "2026-06-29T10:00:00Z"
+}
 ```
+
+`schedule` is `null` if no EventBridge scheduler exists for this tenant.
+
+**404** `{ "error": "tenant not found" }`
+
+---
+
+### PUT /tenants/{id}/schedule
+
+Updates the EventBridge Scheduler only. **Zero database writes.** DB is only read to verify the tenant exists.
+
+```bash
+curl -X PUT $BASE_URL/tenants/tenant-001/schedule \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expression": "cron(30 8 * * ? *)",
+    "timezone":   "Asia/Kolkata",
+    "enabled":    true
+  }'
+```
+
+**Disable without deleting:**
+```bash
+curl -X PUT $BASE_URL/tenants/tenant-001/schedule \
+  -H "Content-Type: application/json" \
+  -d '{ "expression": "cron(0 7 * * ? *)", "timezone": "Asia/Kolkata", "enabled": false }'
+```
+
+**200 OK** `{ "status": "updated" }`
+
+**400** `{ "error": "expression is required" }` / `"timezone is required"`
+
+**404** `{ "error": "tenant not found" }`
+
+**500** `{ "error": "scheduler: ..." }`
 
 ---
 
 ### PUT /tenants/{id}/config
 
-Replaces the config JSON and updates the EventBridge Scheduler.
-**Scheduler is updated first.** If `config.name` changes, the old scheduler is deleted after the new one is created.
+Replaces the tenant_config JSONB. **No EventBridge call.** Do not include schedule fields here.
 
 ```bash
 curl -X PUT $BASE_URL/tenants/tenant-001/config \
   -H "Content-Type: application/json" \
   -d '{
-    "config": {
-      "name":     "tenant-001-run",
-      "timezone": "Asia/Kolkata",
-      "cron":     "cron(30 8 * * ? *)",
-      "enabled":  true
-    }
+    "config": { "name": "Grand Hotel Updated", "hotelCode": "GH001", "region": "APAC" }
   }'
 ```
 
-**Disable the scheduler (pause without deleting):**
+**200 OK** `{ "status": "updated" }`
 
-```bash
-curl -X PUT $BASE_URL/tenants/tenant-001/config \
-  -H "Content-Type: application/json" \
-  -d '{
-    "config": {
-      "name":     "tenant-001-run",
-      "timezone": "Asia/Kolkata",
-      "cron":     "cron(0 7 * * ? *)",
-      "enabled":  false
-    }
-  }'
-```
+**400** `{ "error": "config is required" }`
 
-**200 OK**
-```json
-{ "status": "updated" }
-```
+**404** `{ "error": "tenant not found" }`
 
-**400 Bad Request** — same field errors as POST.
-
-**404 Not Found**
-```json
-{ "error": "tenant not found" }
-```
+**500** `{ "error": "..." }`
 
 ---
 
 ### DELETE /tenants/{id}
 
-Deletes the tenant row (cascades to `tenant_config`), then deletes the EventBridge Scheduler.
+Deletes the tenant from DB, then deletes the EventBridge Scheduler.
 
 ```bash
 curl -X DELETE $BASE_URL/tenants/tenant-001
 ```
 
-**200 OK**
-```json
-{ "status": "deleted" }
-```
+**200 OK** `{ "status": "deleted" }`
 
-**404 Not Found**
-```json
-{ "error": "tenant not found" }
-```
+**404** `{ "error": "tenant not found" }`
+
+**500** `{ "error": "delete scheduler: ..." }`
 
 ---
 
-### Timezone names
-
-Use IANA timezone names. Common examples:
+### Timezone reference
 
 ```
 Asia/Kolkata          UTC+5:30, no DST
@@ -765,15 +613,12 @@ America/New_York      UTC-5 (EST) / UTC-4 (EDT)
 Europe/London         UTC+0 (GMT) / UTC+1 (BST)
 Asia/Tokyo            UTC+9, no DST
 Asia/Dubai            UTC+4, no DST
-Australia/Sydney      UTC+10 (AEST) / UTC+11 (AEDT)
-Europe/Paris          UTC+1 (CET) / UTC+2 (CEST)
+Australia/Sydney      UTC+10 / UTC+11
+Europe/Paris          UTC+1 / UTC+2
 Asia/Singapore        UTC+8, no DST
-America/Sao_Paulo     UTC-3 (BRT) / UTC-2 (BRST)
-America/Toronto       UTC-5 (EST) / UTC-4 (EDT)
-UTC                   Always UTC+0
+America/Sao_Paulo     UTC-3 / UTC-2
+America/Toronto       UTC-5 / UTC-4
 ```
-
-Full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 
 ---
 
@@ -781,130 +626,54 @@ Full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 
 ### Prerequisites
 
-- AWS CLI configured with an IAM user/role that can create Lambda, RDS, EventBridge, SQS, IAM, API Gateway resources
-- Go 1.21+
-- Terraform >= 1.6
-- `zip` command (Linux/macOS) or Git Bash on Windows
+- AWS CLI, Go 1.21+, Terraform >= 1.6, `zip` (Linux/macOS) or Git Bash (Windows)
 
----
-
-### Step 1 — Configure Terraform variables
+### Step 1 — Configure Terraform
 
 ```bash
 cd terraform
-cp terraform.tfvars.example terraform.tfvars
+cp terraform.tfvars.example terraform.tfvars  # set db_password
 ```
 
-Edit `terraform.tfvars`:
+### Step 2 — Build
 
-```hcl
-aws_region  = "us-east-1"
-project     = "pms"
-db_username = "pmsadmin"
-db_password = "YourStrongPassword123!"
-db_name     = "pmsdb"
-```
-
----
-
-### Step 2 — Build Lambda binaries
-
-**Linux / WSL (Makefile):**
 ```bash
-make build
+make build          # Linux/WSL
+.\build.ps1         # Windows PowerShell
 ```
-Outputs to `/tmp/pms-build/` (WSL-native filesystem — avoids NTFS permission errors).
 
-**Windows PowerShell (native):**
-```powershell
-.\build.ps1
-```
-Outputs to `bin\` in the project directory.
+### Step 3 — Deploy
 
-> **Note:** `terraform plan` reads the zip via `filebase64sha256` at plan time, so the zips must exist before running `terraform plan`.
-
----
-
-### Step 3 — Deploy infrastructure
-
-**Recommended — use `make deploy` (handles all phases automatically):**
 ```bash
 make deploy
 ```
 
-`make deploy` runs in order:
-1. `make build` — compiles and zips both Lambdas
-2. `terraform apply -target=aws_s3_bucket.lambda_artifacts` — creates the S3 bucket first
-3. `make upload` — uploads both zips to S3
-4. `terraform apply` — creates all remaining resources
+Runs: build → create S3 bucket → upload zips → full `terraform apply`. Takes ~8–10 min (RDS startup).
 
-Total deploy time is ~8–10 minutes, mostly waiting for RDS.
-
-After `apply`:
-
+After apply:
 ```
-api_endpoint           = "https://abc123.execute-api.us-east-1.amazonaws.com"
-rds_endpoint           = "pms-postgres.xxxx.us-east-1.rds.amazonaws.com"
-sqs_queue_url          = "https://sqs.us-east-1.amazonaws.com/123456/pms-queue"
-scheduler_group_name   = "pms-schedulers"
-trigger_lambda_arn     = "arn:aws:lambda:us-east-1:123456:function:pms-trigger"
-lambda_bucket          = "pms-lambda-<account-id>"
+api_endpoint  = "https://abc123.execute-api.us-east-1.amazonaws.com"
+rds_endpoint  = "pms-postgres.xxxx.us-east-1.rds.amazonaws.com"
 ```
 
----
-
-### Step 4 — Seed 10 tenants
+### Step 4 — Seed
 
 ```bash
 export API_URL=https://abc123.execute-api.us-east-1.amazonaws.com
 make seed
 ```
 
-**Windows PowerShell:**
-```powershell
-$env:API_URL = "https://abc123.execute-api.us-east-1.amazonaws.com"
-go run ./scripts/seed
-```
-
-Expected output:
-```
-✓ tenant-001 | Opera        | cron(0 7  * * ? *) | Asia/Kolkata
-✓ tenant-002 | Mews         | cron(0 9  * * ? *) | America/New_York
-✓ tenant-003 | Apaleo       | cron(0 18 * * ? *) | Europe/London
-...
-Done. created=10 failed=0
-```
-
----
-
-### Step 5 — Verify schedulers were created
+### Step 5 — Verify
 
 ```bash
-aws scheduler list-schedules \
-  --group-name pms-schedulers \
-  --query "Schedules[*].{Name:Name,State:State}" \
-  --output table
-```
+# List schedulers
+aws scheduler list-schedules --group-name pms-schedulers \
+  --query "Schedules[*].{Name:Name,State:State}" --output table
 
-Get the expression and timezone for a specific scheduler:
-
-```bash
-aws scheduler get-schedule \
-  --group-name pms-schedulers \
-  --name tenant-001-run \
+# Get one scheduler's live details
+aws scheduler get-schedule --group-name pms-schedulers --name tenant-001 \
   --query "{Expression:ScheduleExpression,Timezone:ScheduleExpressionTimezone,State:State}"
 ```
-
-Expected:
-```json
-{
-    "Expression": "cron(0 7 * * ? *)",
-    "Timezone": "Asia/Kolkata",
-    "State": "ENABLED"
-}
-```
-
----
 
 ### Updating Lambda code
 
@@ -913,87 +682,62 @@ make build && make upload
 cd terraform && terraform apply -auto-approve
 ```
 
-Or:
-```bash
-make deploy
-```
-
----
-
 ### Teardown
 
 ```bash
 cd terraform && terraform destroy
 ```
 
-RDS data is lost (`skip_final_snapshot = true`).
-
 ---
 
 ## 11. Testing & Verification
 
-### Manual trigger — fire a Lambda immediately
+### Manual trigger
 
 ```bash
 aws lambda invoke \
   --function-name pms-trigger \
   --payload '{"tenantId":"tenant-001"}' \
   --cli-binary-format raw-in-base64-out \
-  response.json
-
-cat response.json
-# null means success
+  response.json && cat response.json
 ```
 
-### Check CloudWatch logs
+### CloudWatch logs
 
 ```bash
 aws logs tail /aws/lambda/pms-api     --follow
-aws logs tail /aws/lambda/pms-trigger --follow
+aws logs tail /aws/lambda/pms-trigger --follow | jq .
 ```
 
-After a trigger invocation:
-
-```json
-{"level":"INFO","msg":"trigger started","tenantId":"tenant-001"}
-{"level":"INFO","msg":"db: tenant loaded","tenantId":"tenant-001","pmsProvider":"Opera","scheduleName":"tenant-001-run"}
-{"level":"INFO","msg":"trigger complete","tenantId":"tenant-001","sqsMessageId":"abc-12345","durationMs":120}
-```
-
-### Read messages from SQS
+### SQS message
 
 ```bash
 aws sqs receive-message \
   --queue-url $(cd terraform && terraform output -raw sqs_queue_url) \
-  --message-attribute-names tenantId \
-  --query "Messages[0].Body" \
-  --output text | python3 -m json.tool
+  --query "Messages[0].Body" --output text | python3 -m json.tool
 ```
 
-Expected output:
-
+Expected:
 ```json
-{
-  "tenantId":    "tenant-001",
-  "pmsProvider": "Opera",
-  "executedAt":  "2026-06-29T01:30:00Z"
-}
+{ "tenantId": "tenant-001", "pmsProvider": "Opera", "executedAt": "2026-06-29T01:30:00Z" }
 ```
 
-### Verify a schedule update takes effect immediately
+### Verify schedule update
 
 ```bash
-curl -X PUT $BASE_URL/tenants/tenant-001/config \
+curl -X PUT $BASE_URL/tenants/tenant-001/schedule \
   -H "Content-Type: application/json" \
-  -d '{"config":{"name":"tenant-001-run","timezone":"Asia/Kolkata","cron":"cron(30 9 * * ? *)","enabled":true}}'
+  -d '{"expression":"cron(30 9 * * ? *)","timezone":"Asia/Kolkata","enabled":true}'
 
-aws scheduler get-schedule \
-  --group-name pms-schedulers \
-  --name tenant-001-run \
+# Confirm EventBridge was updated
+aws scheduler get-schedule --group-name pms-schedulers --name tenant-001 \
   --query "{Expression:ScheduleExpression,Timezone:ScheduleExpressionTimezone}"
-```
+# → { "Expression": "cron(30 9 * * ? *)", "Timezone": "Asia/Kolkata" }
 
-Expected: `{ "Expression": "cron(30 9 * * ? *)", "Timezone": "Asia/Kolkata" }`
+# Confirm DB was NOT changed (it has no schedule data to change)
+curl $BASE_URL/tenants/tenant-001
+# → schedule.expression will show "cron(30 9 * * ? *)" — fetched live from EventBridge
+```
 
 ---
 
@@ -1001,20 +745,30 @@ Expected: `{ "Expression": "cron(30 9 * * ? *)", "Timezone": "Asia/Kolkata" }`
 
 ### Scheduler recovery
 
-If schedulers are accidentally deleted:
+Since schedule data lives only in EventBridge, recovery means recreating the schedulers. The DB tells you *who* the tenants are; you supply the schedule.
 
 ```bash
-# 1. List all enabled tenants
-psql "postgresql://pmsadmin:<pw>@<rds-endpoint>:5432/pmsdb" \
-  -c "SELECT t.tenant_id, tc.config FROM tenant t JOIN tenant_config tc ON t.tenant_id = tc.tenant_id WHERE tc.config->>'enabled' = 'true';"
-
-# 2. Re-PUT each tenant's config to recreate their scheduler
-curl -X PUT $BASE_URL/tenants/tenant-001/config \
+# Re-PUT schedule for a specific tenant
+curl -X PUT $BASE_URL/tenants/tenant-001/schedule \
   -H "Content-Type: application/json" \
-  -d '{"config":{"name":"tenant-001-run","timezone":"Asia/Kolkata","cron":"cron(0 7 * * ? *)","enabled":true}}'
+  -d '{"expression":"cron(0 7 * * ? *)","timezone":"Asia/Kolkata","enabled":true}'
 ```
 
-### Dead letter queue monitoring
+Or run `terraform apply` — pre-defined schedulers in `scheduler.tf` will be recreated if deleted (Terraform detects they're missing in state).
+
+### Disabling a tenant
+
+```bash
+# Pause
+curl -X PUT $BASE_URL/tenants/tenant-001/schedule \
+  -d '{"expression":"cron(0 7 * * ? *)","timezone":"Asia/Kolkata","enabled":false}'
+
+# Resume
+curl -X PUT $BASE_URL/tenants/tenant-001/schedule \
+  -d '{"expression":"cron(0 7 * * ? *)","timezone":"Asia/Kolkata","enabled":true}'
+```
+
+### Dead letter queue
 
 ```bash
 aws sqs get-queue-attributes \
@@ -1022,169 +776,88 @@ aws sqs get-queue-attributes \
   --attribute-names ApproximateNumberOfMessages
 ```
 
-Any value above 0 means a tenant's job failed all 3 retries.
-
-### Disabling a tenant temporarily
-
-```bash
-# Pause
-curl -X PUT $BASE_URL/tenants/tenant-003/config \
-  -H "Content-Type: application/json" \
-  -d '{"config":{"name":"tenant-003-run","timezone":"Europe/London","cron":"cron(0 18 * * ? *)","enabled":false}}'
-
-# Resume
-curl -X PUT $BASE_URL/tenants/tenant-003/config \
-  -H "Content-Type: application/json" \
-  -d '{"config":{"name":"tenant-003-run","timezone":"Europe/London","cron":"cron(0 18 * * ? *)","enabled":true}}'
-```
-
-### Scaling to hundreds of tenants
-
-Each tenant is one EventBridge Scheduler. AWS supports up to 1,000,000 schedulers per account. The system scales linearly — no code changes required.
+Any value > 0 means a tenant's trigger failed all 3 retries.
 
 ---
 
 ## 13. Limitations & Trade-offs
 
-These are known weaknesses in the current design. They are acceptable for a simple dev/internal system but should be addressed before production use at scale.
-
----
-
 ### 1. One tenant can only have one schedule
 
-`tenant_config` uses `tenant_id` as its PRIMARY KEY, enforcing a strict one-to-one relationship between a tenant and its config. A tenant cannot have multiple schedules — for example, a hotel that wants to run a job at 07:00 **and** at 18:00 every day cannot be represented. The entire config blob is replaced on every `PUT /tenants/{id}/config`, so there is no way to add a second schedule without redesigning the schema.
-
-**What would be needed to fix this:** Change `tenant_config` to a one-to-many table (drop the PK constraint, add a surrogate key, allow multiple rows per `tenant_id`), and update the API and EventBridge scheduler naming accordingly.
-
----
+`tenant_id` is the primary key AND the EventBridge scheduler name. One tenant maps to exactly one scheduler. A hotel that needs both a 07:00 and an 18:00 job cannot be expressed — it would need two separate tenant records.
 
 ### 2. One tenant can only have one PMS provider
 
-`pms_provider` is a single `VARCHAR(100)` column on the `tenant` row. A tenant is locked to one provider. If a hotel group uses both Opera for front-desk and Mews for F&B, they cannot be represented as one tenant — they would need two separate tenant records with duplicate scheduling config.
+`pms_provider` is a single `VARCHAR(100)` column. A hotel group using two systems needs two separate tenant records.
 
-**What would be needed to fix this:** Move `pms_provider` out of the `tenant` table into a separate `tenant_provider` join table (many-to-many), and decide how the Trigger Lambda should handle multiple providers per invocation.
+### 3. Schedule data is permanently lost if the EventBridge scheduler is deleted
 
----
+The schedule (expression, timezone, state) is never stored in the database — EventBridge is the only place it exists. If a scheduler is deleted accidentally (via the AWS Console, CLI, or `terraform destroy`), there is no record anywhere of what the schedule was. Recovery requires someone to know the original expression and timezone and re-enter it manually via `PUT /tenants/{id}/schedule`.
 
-### 3. No distributed transaction between EventBridge and RDS (no atomicity)
+### 4. No audit history for schedule changes
 
-EventBridge and RDS are two separate systems. There is no way to make a write to both atomic. The current approach — schedule first, then DB — means three failure modes exist:
+Because schedule data is never written to the database, there is no changelog. If a cron expression is changed via `PUT /tenants/{id}/schedule`, there is no record of what it was before, when it changed, or who changed it. Config changes (`PUT /tenants/{id}/config`) have the same problem — `updated_at` records that a change happened, but not what changed.
 
-| Scenario | Result |
-|----------|--------|
-| EventBridge succeeds, DB succeeds | ✓ Consistent |
-| EventBridge fails | DB write is skipped. Consistent — no orphan. |
-| EventBridge succeeds, DB fails, rollback (Delete) succeeds | Consistent — scheduler cleaned up. |
-| EventBridge succeeds, DB fails, rollback (Delete) also fails | **Orphaned EventBridge scheduler** with no DB record. It will fire indefinitely and the Trigger Lambda will return `tenant not found` every time. |
+### 5. `GET /tenants` cannot show schedule details
 
-There is no automatic detection or cleanup of orphaned schedulers. Manual intervention (listing EventBridge schedulers and comparing against the DB) is required.
+Returning schedule info on the list endpoint would require one `GetSchedule` call to EventBridge per tenant — N tenants = N API calls. `ListSchedules` exists but does not return the expression or timezone, only names. So the list endpoint returns only DB data (identity + config) and callers must make a separate `GET /tenants/{id}` per tenant to see the schedule.
 
----
+### 6. Every `GET /tenants/{id}` makes a live EventBridge API call
 
-### 4. Best-effort rollback is not guaranteed
+Schedule data is never cached in the DB, so reading a single tenant always results in two round trips: one to RDS, one to EventBridge. If EventBridge is unavailable, the endpoint returns a 500 even though the tenant identity and config are fine in the database.
 
-The scheduler delete on DB failure is a best-effort call with no retry. If the EventBridge `DeleteSchedule` call fails (network issue, throttle, IAM transient error), the orphaned scheduler is silently left behind. There is no dead-letter mechanism for failed rollbacks.
+### 7. No distributed transaction between EventBridge and RDS
 
----
+On `POST /tenants`: the EventBridge scheduler is created first, then the DB transaction runs. If the DB transaction fails and the best-effort rollback (`DeleteSchedule`) also fails, an orphaned scheduler is left running in EventBridge with no matching DB record. The Trigger Lambda will return `tenant not found` on every fire until it is cleaned up manually.
 
-### 5. `config.name` must be globally unique within the scheduler group
+### 8. Best-effort rollback is not guaranteed
 
-EventBridge Scheduler names must be unique within a group. If two tenants are created with the same `config.name`, the second `CreateSchedule` will succeed (it will call `UpdateSchedule` and overwrite the first tenant's scheduler). Both tenants will share one scheduler — only one will fire correctly.
+The `DeleteSchedule` call on DB failure has no retry. A transient AWS error during rollback leaves an orphaned scheduler silently with no alert.
 
-There is no uniqueness constraint on `config->>'name'` in the database, so this error is only caught at runtime by observing wrong behaviour.
+### 9. Config and schedule are updated on separate paths — no atomic update
 
----
+`PUT /tenants/{id}/schedule` changes only EventBridge. `PUT /tenants/{id}/config` changes only RDS. There is no single operation that updates both. A failure on the second request leaves the two systems partially updated with no automatic compensation.
 
-### 6. No partial config updates
+### 10. No partial updates to config or schedule
 
-`PUT /tenants/{id}/config` replaces the entire config JSON blob. If you only want to change the `cron` field, you must still resend `name`, `timezone`, and `enabled`. There is no PATCH endpoint. Forgetting a field will silently drop it from the stored config.
+`PUT /tenants/{id}/config` replaces the entire JSONB object — omitting a key drops it silently. `PUT /tenants/{id}/schedule` requires all three fields (`expression`, `timezone`, `enabled`) every time. There is no PATCH for either.
 
----
+### 11. No cron expression validation
 
-### 7. No cron expression validation
+`expression` is passed directly to EventBridge. Invalid expressions (e.g. `"cron(99 25 * * ? *)"`) are only rejected at the EventBridge API call — the error is a raw AWS SDK message, not a user-friendly validation response.
 
-`config.cron` is passed directly to EventBridge without any format checking in the API. An invalid expression (e.g. `"cron(99 25 * * ? *)"`) is only caught when EventBridge rejects it, and the error message returned is an AWS SDK error, not a user-friendly validation message.
+### 12. No optimistic locking
 
----
+Two concurrent `PUT /tenants/{id}/schedule` requests both succeed — last writer wins with no conflict detection. Same applies to `PUT /tenants/{id}/config`.
 
-### 8. Brief gap during scheduler rename
+### 13. Config JSONB has no schema enforcement
 
-When `config.name` changes on a `PUT /tenants/{id}/config`, the sequence is:
-1. Create new scheduler (new name)
-2. Delete old scheduler (old name)
+The `config` column accepts any valid JSON. Nothing prevents a caller from accidentally storing schedule fields (`expression`, `timezone`, `enabled`) inside the config object — they will be stored in the DB but have no effect on EventBridge, and will silently diverge from the real schedule.
 
-Between steps 1 and 2 both schedulers exist simultaneously. If step 2 fails, the old scheduler is orphaned. More critically, if the scheduled time falls exactly in this window, the job may fire twice — once from each scheduler.
+### 14. RDS connections scale with Lambda concurrency
 
----
+Each Lambda container holds one PostgreSQL connection. Under high concurrent API traffic, connection count grows until `db.t3.micro` hits its ~85 connection limit. Mitigation: add RDS Proxy.
 
-### 9. No optimistic locking — concurrent updates silently overwrite each other
+### 15. No API authentication
 
-Two simultaneous `PUT /tenants/{id}/config` requests will both succeed. The last writer wins with no conflict detection. There is no ETag, version field, or row locking. In a multi-user system this can silently lose config changes.
-
----
-
-### 10. JSONB config is harder to query and constrain
-
-Storing schedule details as JSONB means:
-
-- **No column-level constraints** — `NOT NULL`, `CHECK`, and foreign keys cannot be applied to individual config fields. Validation lives only in application code and can drift.
-- **Harder to filter in SQL** — queries like "find all tenants in Asia/Kolkata" require JSONB operators (`tc.config->>'timezone' = 'Asia/Kolkata'`) rather than a simple `WHERE timezone = 'Asia/Kolkata'`.
-- **No index by default** — JSONB fields are not indexed unless a GIN index is explicitly created.
-
----
-
-### 11. No audit history
-
-`updated_at` records when the config was last changed, but not what it was before or who changed it. There is no changelog table, no versioning, and no way to roll back a config to a previous value without restoring a DB snapshot.
-
----
-
-### 12. Trigger Lambda execution window race on create
-
-On `POST /tenants`, the sequence is:
-1. EventBridge scheduler created
-2. DB transaction committed
-
-If EventBridge fires (extremely unlikely but theoretically possible if the cron fires at the exact moment of creation) before step 2 commits, the Trigger Lambda will call `db.GetTenant()` and get `tenant not found`, causing the invocation to fail. This is an inherent consequence of the "schedule first" ordering.
-
----
-
-### 13. RDS connection count scales with concurrent Lambda instances
-
-Each Lambda container holds one open PostgreSQL connection. Under a burst of concurrent API calls (many tenants being created simultaneously), many Lambda containers spin up in parallel, each opening a new connection. RDS `db.t3.micro` supports ~85 connections maximum. At scale, this will cause `too many connections` errors.
-
-**Mitigation:** Add RDS Proxy in front of the database to pool connections at the infrastructure level.
-
----
-
-### 14. No API authentication
-
-All endpoints are publicly accessible. Anyone with the API Gateway URL can create, update, or delete tenants. There is no API key, JWT, or IAM authorizer.
+All endpoints are publicly accessible to anyone with the API Gateway URL.
 
 ---
 
 ## 14. Pricing Estimate
 
-All prices are **us-east-1, on-demand**. Assumes 30-day month.
+**Fixed costs (~$14.72/month):** RDS `db.t3.micro` dominates. All other costs (EventBridge, Lambda, SQS) are negligible at PMS scale due to AWS free tiers.
 
-| Component | Monthly (fixed) |
-|---|---|
-| RDS db.t3.micro (PostgreSQL 15, 20 GB gp2) | ~$14.71 |
-| S3, API Gateway, CloudWatch Logs | < $0.10 |
-
-Variable costs per tenant invocation are negligible at typical PMS scale — Lambda, SQS, and EventBridge Scheduler all have free tiers that cover thousands of daily invocations.
-
-**RDS is the dominant cost** regardless of tenant count. Going from 10 to 1,000 tenants adds less than $1/month in variable costs.
+Adding tenants adds almost nothing to the bill. The cost is flat regardless of whether you have 10 or 500 tenants running daily jobs.
 
 ### Production hardening checklist
 
-| Item | Current (dev) | Production recommendation |
-|------|--------------|--------------------------|
-| RDS access | Publicly accessible | Private subnet + RDS Proxy |
-| RDS security group | Open to 0.0.0.0/0 | Restrict to Lambda security group only |
-| DB credentials | Terraform variable | AWS Secrets Manager + rotation |
-| Terraform state | Local | S3 backend + DynamoDB locking |
+| Item | Current | Production |
+|------|---------|-----------|
+| RDS access | Public, 0.0.0.0/0 | Private subnet + RDS Proxy |
+| DB credentials | Terraform variable | Secrets Manager + rotation |
+| Terraform state | Local | S3 + DynamoDB locking |
 | Lambda in VPC | No | Yes — same VPC as RDS |
-| API authentication | None | API Gateway authorizer (JWT/Cognito/IAM) |
-| RDS snapshot | `skip_final_snapshot = true` | `skip_final_snapshot = false` |
-| RDS deletion protection | `false` | `true` |
+| API auth | None | JWT / Cognito / IAM authorizer |
+| RDS snapshot | Skipped | Enabled |
+| RDS deletion protection | Off | On |

@@ -12,30 +12,25 @@ import (
 	"os"
 )
 
-type scheduleConfig struct {
-	Name     string `json:"name"`
-	Timezone string `json:"timezone"`
-	Cron     string `json:"cron"`
-	Enabled  bool   `json:"enabled"`
-}
-
 type tenantReq struct {
-	TenantID    string         `json:"tenantId"`
-	PMSProvider string         `json:"pmsProvider"`
-	Config      scheduleConfig `json:"config"`
+	TenantID    string `json:"tenantId"`
+	PMSProvider string `json:"pmsProvider"`
+	Expression  string `json:"expression"`
+	Timezone    string `json:"timezone"`
+	Enabled     bool   `json:"enabled"`
 }
 
 var tenants = []tenantReq{
-	{"tenant-001", "Opera",   scheduleConfig{"tenant-001-run", "Asia/Kolkata",      "cron(0 7  * * ? *)", true}},
-	{"tenant-002", "Mews",    scheduleConfig{"tenant-002-run", "America/New_York",  "cron(0 9  * * ? *)", true}},
-	{"tenant-003", "Apaleo",  scheduleConfig{"tenant-003-run", "Europe/London",     "cron(0 18 * * ? *)", true}},
-	{"tenant-004", "Opera",   scheduleConfig{"tenant-004-run", "Asia/Tokyo",        "cron(0 6  * * ? *)", true}},
-	{"tenant-005", "Mews",    scheduleConfig{"tenant-005-run", "Asia/Dubai",        "cron(0 8  * * ? *)", true}},
-	{"tenant-006", "Apaleo",  scheduleConfig{"tenant-006-run", "Australia/Sydney",  "cron(0 10 * * ? *)", true}},
-	{"tenant-007", "Opera",   scheduleConfig{"tenant-007-run", "Europe/Paris",      "cron(0 20 * * ? *)", true}},
-	{"tenant-008", "Mews",    scheduleConfig{"tenant-008-run", "Asia/Singapore",    "cron(0 11 * * ? *)", true}},
-	{"tenant-009", "Apaleo",  scheduleConfig{"tenant-009-run", "America/Sao_Paulo", "cron(0 14 * * ? *)", true}},
-	{"tenant-010", "Opera",   scheduleConfig{"tenant-010-run", "America/Toronto",   "cron(30 7 * * ? *)", true}},
+	{"tenant-001", "Opera",  "cron(0 7  * * ? *)", "Asia/Kolkata",      true},
+	{"tenant-002", "Mews",   "cron(0 9  * * ? *)", "America/New_York",  true},
+	{"tenant-003", "Apaleo", "cron(0 18 * * ? *)", "Europe/London",     true},
+	{"tenant-004", "Opera",  "cron(0 6  * * ? *)", "Asia/Tokyo",        true},
+	{"tenant-005", "Mews",   "cron(0 8  * * ? *)", "Asia/Dubai",        true},
+	{"tenant-006", "Apaleo", "cron(0 10 * * ? *)", "Australia/Sydney",  true},
+	{"tenant-007", "Opera",  "cron(0 20 * * ? *)", "Europe/Paris",      true},
+	{"tenant-008", "Mews",   "cron(0 11 * * ? *)", "Asia/Singapore",    true},
+	{"tenant-009", "Apaleo", "cron(0 14 * * ? *)", "America/Sao_Paulo", true},
+	{"tenant-010", "Opera",  "cron(30 7 * * ? *)", "America/Toronto",   true},
 }
 
 func main() {
@@ -58,7 +53,7 @@ func main() {
 		resp.Body.Close()
 
 		if resp.StatusCode == 201 {
-			fmt.Printf("✓ %s | %-12s | %s | %s\n", t.TenantID, t.PMSProvider, t.Config.Cron, t.Config.Timezone)
+			fmt.Printf("✓ %s | %-12s | %s | %s\n", t.TenantID, t.PMSProvider, t.Expression, t.Timezone)
 			created++
 		} else {
 			fmt.Printf("✗ %s | HTTP %d: %s\n", t.TenantID, resp.StatusCode, string(respBody))

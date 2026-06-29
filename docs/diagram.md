@@ -21,9 +21,10 @@ flowchart TD
         AG1["POST   /tenants"]
         AG2["GET    /tenants"]
         AG3["GET    /tenants/{id}"]
-        AG4["PUT    /tenants/{id}/config"]
-        AG5["DELETE /tenants/{id}"]
-        AG6["GET    /health"]
+        AG4["PUT    /tenants/{id}/schedule"]
+        AG5["PUT    /tenants/{id}/config"]
+        AG6["DELETE /tenants/{id}"]
+        AG7["GET    /health"]
     end
 
     CLIENT -->|"HTTPS request"| APIGW
@@ -34,27 +35,26 @@ flowchart TD
 
         subgraph AINIT["init()  — cold start only"]
             AI1["db.Connect()\nsql.Open pgx driver\nconn.Ping()"]
-            AI2["db.Migrate()\nDetects old schema via tenant table existence\nDrops legacy tenant_config if needed\nCREATE TABLE IF NOT EXISTS tenant\nCREATE TABLE IF NOT EXISTS tenant_config"]
+            AI2["db.Migrate()\nDROP TABLE IF EXISTS tenant_config CASCADE\nCREATE TABLE IF NOT EXISTS tenant\n  (tenant_id, pms_provider, config JSONB, ...)\n(idempotent)"]
             AI1 --> AI2
         end
 
         subgraph AHAND["handler(ctx, APIGatewayV2HTTPRequest)"]
             direction TB
-            AV["validateConfig(config)\nrequire config.name + config.timezone + config.cron"]
 
-            AR1["POST /tenants\nsched.Upsert(config.name, config.timezone, config.cron, tenantID, enabled)\ndb.CreateTenant(tenantID, pmsProvider, config)  [tx]\n  INSERT INTO tenant\n  INSERT INTO tenant_config"]
+            AR1["POST /tenants\n1. sched.Upsert(tenantID, expression, timezone, enabled)\n   → CreateSchedule in pms-schedulers group\n2. db.CreateTenant(tenantID, pmsProvider, config)\n   → INSERT INTO tenant (single row, config JSONB included)\n   Rollback: sched.Delete on DB failure"]
 
-            AR2["GET /tenants\ndb.ListTenants(ctx)\nSELECT t.*, tc.config FROM tenant t JOIN tenant_config tc"]
+            AR2["GET /tenants\ndb.ListTenants(ctx)\nSELECT tenant_id, pms_provider, config, created_at FROM tenant\n(identity + config — NO schedule)"]
 
-            AR3["GET /tenants/{id}\ndb.GetTenant(ctx, tenantID)\nSELECT t.*, tc.config FROM tenant t JOIN tenant_config tc"]
+            AR3["GET /tenants/{id}\ndb.GetTenant(ctx, tenantID)\n→ SELECT from tenant (single table, no join)\nsched.Get(ctx, tenantID)\n→ EventBridge GetSchedule (live read)\nreturns identity + config + schedule"]
 
-            AR4["PUT /tenants/{id}/config\ndb.GetTenant() → fetch old config.name\nsched.Upsert(new config)\nif name changed → sched.Delete(oldName)\ndb.UpdateTenantConfig(tenantID, config)"]
+            AR4["PUT /tenants/{id}/schedule\ndb.GetTenant() → existence check only\nsched.Upsert(tenantID, expression, timezone, enabled)\n→ UpdateSchedule (fallback CreateSchedule)\nNO DB WRITE"]
 
-            AR5["DELETE /tenants/{id}\ndb.GetTenant() → fetch config.name\ndb.DeleteTenant()  ← cascades to tenant_config\nsched.Delete(config.name)"]
+            AR5["PUT /tenants/{id}/config\ndb.GetTenant() → existence check only\ndb.UpdateConfig(tenantID, config)\n→ UPDATE tenant SET config = $2, updated_at = NOW()\nNO EVENTBRIDGE CALL"]
 
-            AR6["GET /health\ndb.Ping(ctx)\n200 → {status: ok}\n503 → {error: database unavailable}"]
+            AR6["DELETE /tenants/{id}\ndb.GetTenant() → existence check\ndb.DeleteTenant()\n→ DELETE FROM tenant WHERE tenant_id = $1\nsched.Delete(tenantID)"]
 
-            AV --> AR1 & AR4
+            AR7["GET /health\ndb.Ping(ctx)\n200 → {status: ok}\n503 → {error: database unavailable}"]
         end
     end
 
@@ -64,24 +64,22 @@ flowchart TD
     subgraph SCHPKG["internal/scheduler  —  Scheduler Package"]
         direction TB
 
-        SU["Upsert(name, timezone, cronExpr, tenantID, enabled)\n───────────────────────────────────────────────\nstate = ENABLED if enabled else DISABLED\npayload = {tenantId: tenantID}\n1. UpdateSchedule(Name, GroupName, Expression, Timezone, State, Target)\n   success  → return nil\n   ResourceNotFoundException  → fall through\n2. CreateSchedule(same params)"]
+        SGET["Get(tenantID)\n───────────────────────────────────────────────\nGetSchedule(Name=tenantID, GroupName)\n→ returns ScheduleInfo{Expression, Timezone, State}\nResourceNotFoundException → return nil (not found)"]
 
-        SDEL["Delete(name)\n───────────────────────────────────────────────\nDeleteSchedule(Name, GroupName)\nResourceNotFoundException  → no-op  (idempotent)"]
+        SU["Upsert(tenantID, expression, timezone, enabled)\n───────────────────────────────────────────────\nstate = ENABLED if enabled else DISABLED\npayload = {tenantId: tenantID}\n1. UpdateSchedule(Name=tenantID, ...)\n   success  → return nil\n   ResourceNotFoundException  → fall through\n2. CreateSchedule(same params)"]
+
+        SDEL["Delete(tenantID)\n───────────────────────────────────────────────\nDeleteSchedule(Name=tenantID, GroupName)\nResourceNotFoundException  → no-op  (idempotent)"]
     end
 
-    APIL -->|"Upsert / Delete\ncalls"| SCHPKG
+    APIL -->|"Get / Upsert / Delete\ncalls"| SCHPKG
 
     %% ── RDS ───────────────────────────────────────────────────────────────────
     subgraph RDSBOX["RDS PostgreSQL 15  —  db.t3.micro  ·  20 GB gp2  ·  single-AZ"]
         direction TB
-        TENANT[("tenant\n══════════════════════════════\ntenant_id     VARCHAR(50)   PK\npms_provider  VARCHAR(100)  NOT NULL\ncreated_at    TIMESTAMPTZ")]:::db
-
-        TCONFIG[("tenant_config\n══════════════════════════════\ntenant_id  VARCHAR(50)   PK → tenant(tenant_id)\nconfig     JSONB  NOT NULL\n  {\n    name:     string,\n    timezone: string,\n    cron:     string,\n    enabled:  bool\n  }\ncreated_at TIMESTAMPTZ\nupdated_at TIMESTAMPTZ")]:::db
-
-        TENANT -->|"ON DELETE CASCADE"| TCONFIG
+        TENANT[("tenant\n══════════════════════════════\ntenant_id     VARCHAR(50)   PK\npms_provider  VARCHAR(100)  NOT NULL\nconfig        JSONB  NOT NULL  DEFAULT '{}'\n  Arbitrary non-schedule metadata:\n  { name, hotelCode, region, ... }\n  NO expression / timezone / enabled\ncreated_at    TIMESTAMPTZ\nupdated_at    TIMESTAMPTZ")]:::db
     end
 
-    APIL  -->|"CreateTenant [tx]\nListTenants\nGetTenant\nUpdateTenantConfig\nDeleteTenant\nPing"| RDSBOX
+    APIL  -->|"CreateTenant\nListTenants\nGetTenant\nUpdateConfig\nDeleteTenant\nPing"| RDSBOX
 
     %% ── IAM ───────────────────────────────────────────────────────────────────
     subgraph IAMBOX["IAM Roles"]
@@ -99,14 +97,16 @@ flowchart TD
     %% ── EVENTBRIDGE ───────────────────────────────────────────────────────────
     subgraph EBGROUP["EventBridge Scheduler Group — pms-schedulers"]
         direction TB
-        EB1["tenant-001-run\nExpression : cron(0 7 * * ? *)\nTimezone   : Asia/Kolkata  ← DST-aware\nState      : ENABLED\nTarget ARN : pms-trigger Lambda\nInput      : {tenantId: 'tenant-001'}"]:::eb
+        EB1["tenant-001\nExpression : cron(0 7 * * ? *)\nTimezone   : Asia/Kolkata  ← DST-aware\nState      : ENABLED\nTarget ARN : pms-trigger Lambda\nInput      : {tenantId: 'tenant-001'}\nScheduler name = tenantId (deterministic)"]:::eb
 
-        EB2["tenant-002-run\nExpression : cron(0 9 * * ? *)\nTimezone   : America/New_York  ← DST-aware\nState      : ENABLED\nInput      : {tenantId: 'tenant-002'}"]:::eb
+        EB2["tenant-002\nExpression : cron(0 9 * * ? *)\nTimezone   : America/New_York  ← DST-aware\nState      : ENABLED\nInput      : {tenantId: 'tenant-002'}"]:::eb
 
-        EB3["tenant-NNN-run\nExpression : rate(1 hour)\nTimezone   : UTC\nState      : DISABLED  ← enabled=false\nInput      : {tenantId: 'tenant-NNN'}"]:::eb
+        EB3["tenant-NNN\nExpression : rate(1 hour)\nTimezone   : UTC\nState      : DISABLED  ← enabled=false\nInput      : {tenantId: 'tenant-NNN'}"]:::eb
+
+        EBNOTE["⚠ Schedule details (expression, timezone, state)\nlive ONLY here — never in RDS.\nTerraform-defined schedulers use\nlifecycle { ignore_changes = all }"]
     end
 
-    SCHPKG -->|"CreateSchedule\nUpdateSchedule\nDeleteSchedule\nvia AWS SDK"| EBGROUP
+    SCHPKG -->|"GetSchedule\nCreateSchedule\nUpdateSchedule\nDeleteSchedule\nvia AWS SDK"| EBGROUP
 
     %% ── TRIGGER LAMBDA ────────────────────────────────────────────────────────
     subgraph TRIGL["Trigger Lambda — pms-trigger  ·  256 MB  ·  60 s timeout  ·  provided.al2023"]
@@ -120,7 +120,7 @@ flowchart TD
 
         subgraph THAND["handler(ctx, TriggerEvent{TenantID string})"]
             direction TB
-            T1["Step 1 — db.GetTenant(ctx, event.TenantID)\nSELECT t.*, tc.config\nFROM tenant t JOIN tenant_config tc\nreturns pmsProvider + config"]
+            T1["Step 1 — db.GetTenant(ctx, event.TenantID)\nSELECT tenant_id, pms_provider, config, created_at FROM tenant\nreturns pmsProvider (config not used in payload)"]
 
             T2["Step 2 — sqsClient.SendMessage(ctx, input)\nQueueUrl  : SQS_QUEUE_URL env var\nBody      : JSON{tenantId, pmsProvider, executedAt}\nMessageAttribute: tenantId (String)"]
 
@@ -169,6 +169,15 @@ flowchart TD
 
 ---
 
+## Sources of Truth
+
+| Data | Where it lives |
+|------|---------------|
+| Tenant identity (`tenant_id`, `pms_provider`) + non-schedule metadata (`config`) | RDS `tenant` table |
+| Schedule (`expression`, `timezone`, `state`) | EventBridge Scheduler only |
+
+---
+
 ## Component Reference
 
 ### Client
@@ -185,37 +194,38 @@ Lambda proxy integration — forwards the full request to the API Lambda and ret
 
 **`init()` — runs once per cold start:**
 - `db.Connect()` — opens PostgreSQL connection via `pgx/v5/stdlib`.
-- `db.Migrate()` — detects old schema by checking for the `tenant` table. If absent, drops the legacy `tenant_config` table and creates both new tables. Idempotent on subsequent cold starts.
+- `db.Migrate()` — creates `tenant` and `tenant_config` tables with `IF NOT EXISTS`. Idempotent.
 
-**`handler(ctx, req)` — runs on every request:**
-- Parses method + path, extracts `tenantID` from path segments.
-- `validateConfig()` — checks `config.name`, `config.timezone`, and `config.cron` are present.
-- For create/update: calls EventBridge **first**, then writes to DB. Rolls back the scheduler on DB failure.
-- For delete: fetches `config.name` from DB (to know the scheduler name), then deletes DB row (cascades), then deletes scheduler.
+**Route summary:**
+
+| Route | DB operation | EventBridge operation |
+|-------|-------------|----------------------|
+| `GET /tenants` | ListTenants (single table) | none |
+| `POST /tenants` | CreateTenant (single INSERT with config) | Upsert (first) |
+| `GET /tenants/{id}` | GetTenant (single table) | Get (live read) |
+| `PUT /tenants/{id}/schedule` | GetTenant (existence only) | Upsert |
+| `PUT /tenants/{id}/config` | GetTenant (existence only) + UpdateConfig | none |
+| `DELETE /tenants/{id}` | DeleteTenant (cascades) | Delete (after) |
 
 ---
 
 ### internal/scheduler Package
 
-**`Upsert(name, timezone, cronExpr, tenantID, enabled)`** — the hot-path write.
-- Tries `UpdateSchedule` first (no existence check needed).
-- Falls back to `CreateSchedule` only on `ResourceNotFoundException`.
-- `enabled=false` sets `State=DISABLED` — the scheduler exists but won't fire.
-- The cron expression is passed through as-is — no conversion in application code.
+**`schedulerName(tenantID) = tenantID`** — deterministic, no lookup needed.
 
-**`Delete(name)`** — calls `DeleteSchedule` by the scheduler's name. Ignores `ResourceNotFoundException` (idempotent).
+**`Get(tenantID)`** — calls `GetSchedule` live. Returns `nil` if no scheduler exists (not an error).
+
+**`Upsert(tenantID, expression, timezone, enabled)`** — tries `UpdateSchedule` first, falls back to `CreateSchedule` on `ResourceNotFoundException`. Never stores anything in DB.
+
+**`Delete(tenantID)`** — calls `DeleteSchedule`. Ignores `ResourceNotFoundException` (idempotent).
 
 ---
 
-### RDS PostgreSQL (`tenant` + `tenant_config`)
+### RDS PostgreSQL (`tenant`)
 
-Two tables:
-- `tenant` — one row per tenant: `tenant_id`, `pms_provider`.
-- `tenant_config` — one JSONB config per tenant, foreign-keyed to `tenant` with `ON DELETE CASCADE`.
+Single table — one row per tenant: `tenant_id`, `pms_provider`, `config` JSONB, `created_at`, `updated_at`.
 
-The `config` JSONB stores `{ name, timezone, cron, enabled }`. `config.name` is the EventBridge scheduler name.
-
-Schedulers are derived resources — they can be deleted and recreated from these tables at any time without data loss.
+`config` holds arbitrary non-schedule metadata (hotel name, codes, etc.) and defaults to `{}`. It does **not** store `expression`, `timezone`, or `enabled` — those live only in EventBridge.
 
 ---
 
@@ -231,12 +241,13 @@ Schedulers are derived resources — they can be deleted and recreated from thes
 
 ### EventBridge Scheduler Group (`pms-schedulers`)
 
-One scheduler per tenant. Each stores:
-- Scheduler name = `config.name` (e.g. `"tenant-001-run"`)
-- The cron/rate expression from `config.cron`
-- The timezone from `config.timezone` (AWS handles DST automatically)
-- The payload `{"tenantId":"tenant-001"}` sent to the Trigger Lambda
-- `State: ENABLED` or `DISABLED` based on `config.enabled`
+One scheduler per tenant. The scheduler name equals `tenantId` exactly. Each scheduler stores:
+- The cron/rate expression
+- The timezone (AWS handles DST automatically)
+- The payload `{"tenantId":"tenant-NNN"}` sent to the Trigger Lambda
+- `State: ENABLED` or `DISABLED`
+
+Terraform-defined schedulers use `lifecycle { ignore_changes = all }` — created once, then owned by the application.
 
 ---
 
@@ -244,7 +255,7 @@ One scheduler per tenant. Each stores:
 
 Receives `{"tenantId":"tenant-001"}` from EventBridge.
 
-1. `db.GetTenant(tenantID)` — loads `pmsProvider` and `config` from the joined tables.
+1. `db.GetTenant(tenantID)` — loads `pmsProvider` from the LEFT JOIN.
 2. Builds SQS payload: `{ tenantId, pmsProvider, executedAt }`.
 3. `sqsClient.SendMessage()` — pushes to `pms-queue` with a `tenantId` MessageAttribute for downstream filtering.
 

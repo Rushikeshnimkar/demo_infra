@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	awssched "github.com/aws/aws-sdk-go-v2/service/scheduler"
 	"github.com/aws/aws-sdk-go-v2/service/scheduler/types"
+	"multi-tenant-scheduler/internal/models"
 )
 
 var client *awssched.Client
@@ -22,14 +23,44 @@ func init() {
 	client = awssched.NewFromConfig(cfg)
 }
 
+// schedulerName derives the EventBridge scheduler name from the tenant ID.
+// Keeping it deterministic means we never need to store the name anywhere.
+func schedulerName(tenantID string) string {
+	return tenantID
+}
+
 func env(key string) *string {
 	return aws.String(os.Getenv(key))
 }
 
+// Get fetches the live schedule for a tenant directly from EventBridge.
+// Returns nil if the scheduler does not exist.
+func Get(ctx context.Context, tenantID string) (*models.ScheduleInfo, error) {
+	got, err := client.GetSchedule(ctx, &awssched.GetScheduleInput{
+		GroupName: env("SCHEDULER_GROUP_NAME"),
+		Name:      aws.String(schedulerName(tenantID)),
+	})
+	if err != nil {
+		var notFound *types.ResourceNotFoundException
+		if errors.As(err, &notFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get scheduler: %w", err)
+	}
+	state := "ENABLED"
+	if got.State == types.ScheduleStateDisabled {
+		state = "DISABLED"
+	}
+	return &models.ScheduleInfo{
+		Expression: aws.ToString(got.ScheduleExpression),
+		Timezone:   aws.ToString(got.ScheduleExpressionTimezone),
+		State:      state,
+	}, nil
+}
+
 // Upsert creates or updates the EventBridge Scheduler for a tenant.
-// name is the scheduler name (from config.Name), cronExpr is passed through directly.
-// Tries Update first and falls back to Create only on ResourceNotFoundException.
-func Upsert(ctx context.Context, name, timezone, cronExpr, tenantID string, enabled bool) error {
+// Tries UpdateSchedule first; falls back to CreateSchedule on ResourceNotFoundException.
+func Upsert(ctx context.Context, tenantID, expression, timezone string, enabled bool) error {
 	state := types.ScheduleStateEnabled
 	if !enabled {
 		state = types.ScheduleStateDisabled
@@ -38,8 +69,8 @@ func Upsert(ctx context.Context, name, timezone, cronExpr, tenantID string, enab
 
 	input := awssched.UpdateScheduleInput{
 		GroupName:                  env("SCHEDULER_GROUP_NAME"),
-		Name:                       aws.String(name),
-		ScheduleExpression:         aws.String(cronExpr),
+		Name:                       aws.String(schedulerName(tenantID)),
+		ScheduleExpression:         aws.String(expression),
 		ScheduleExpressionTimezone: aws.String(timezone),
 		State:                      state,
 		Target: &types.Target{
@@ -76,11 +107,11 @@ func Upsert(ctx context.Context, name, timezone, cronExpr, tenantID string, enab
 	return nil
 }
 
-// Delete removes the scheduler by name. Safe to call when already deleted.
-func Delete(ctx context.Context, name string) error {
+// Delete removes the scheduler for a tenant. Safe to call when already deleted.
+func Delete(ctx context.Context, tenantID string) error {
 	_, err := client.DeleteSchedule(ctx, &awssched.DeleteScheduleInput{
 		GroupName: env("SCHEDULER_GROUP_NAME"),
-		Name:      aws.String(name),
+		Name:      aws.String(schedulerName(tenantID)),
 	})
 	var notFound *types.ResourceNotFoundException
 	if errors.As(err, &notFound) {

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -46,17 +45,21 @@ func errResp(status int, msg string) (events.APIGatewayV2HTTPResponse, error) {
 	return respond(status, map[string]string{"error": msg})
 }
 
-func validateConfig(cfg models.ScheduleConfig) string {
-	if cfg.Name == "" {
-		return "config.name is required"
+func validateSchedule(expression, timezone string) string {
+	if expression == "" {
+		return "expression is required"
 	}
-	if cfg.Timezone == "" {
-		return "config.timezone is required"
-	}
-	if cfg.Cron == "" {
-		return "config.cron is required"
+	if timezone == "" {
+		return "timezone is required"
 	}
 	return ""
+}
+
+func stateStr(enabled bool) string {
+	if enabled {
+		return "ENABLED"
+	}
+	return "DISABLED"
 }
 
 func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
@@ -83,7 +86,7 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 		goto done
 	}
 
-	// GET /tenants
+	// GET /tenants — returns tenant list with config from DB (no schedule details)
 	if method == http.MethodGet && path == "/tenants" {
 		tenants, dbErr := db.ListTenants(ctx)
 		if dbErr != nil {
@@ -92,13 +95,13 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 			goto done
 		}
 		if tenants == nil {
-			tenants = []*models.TenantWithConfig{}
+			tenants = []*models.Tenant{}
 		}
 		resp, err = respond(200, tenants)
 		goto done
 	}
 
-	// POST /tenants
+	// POST /tenants — create scheduler in EventBridge first, then persist tenant + config in DB
 	if method == http.MethodPost && path == "/tenants" {
 		var r models.CreateTenantRequest
 		if jsonErr := json.Unmarshal([]byte(req.Body), &r); jsonErr != nil {
@@ -113,31 +116,35 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 			resp, err = errResp(400, "pmsProvider is required")
 			goto done
 		}
-		if msg := validateConfig(r.Config); msg != "" {
+		if msg := validateSchedule(r.Expression, r.Timezone); msg != "" {
 			resp, err = errResp(400, msg)
 			goto done
 		}
 
-		// Schedule first, then DB (rollback scheduler on DB failure)
-		if schedErr := sched.Upsert(ctx, r.Config.Name, r.Config.Timezone, r.Config.Cron, r.TenantID, r.Config.Enabled); schedErr != nil {
+		if schedErr := sched.Upsert(ctx, r.TenantID, r.Expression, r.Timezone, r.Enabled); schedErr != nil {
 			logger.Error("scheduler: upsert failed", "tenantId", r.TenantID, "error", schedErr)
 			resp, err = errResp(500, fmt.Sprintf("scheduler: %v", schedErr))
 			goto done
 		}
-		logger.Info("scheduler: created", "tenantId", r.TenantID, "scheduleName", r.Config.Name)
+		logger.Info("scheduler: created", "tenantId", r.TenantID)
 
 		if dbErr := db.CreateTenant(ctx, r.TenantID, r.PMSProvider, r.Config); dbErr != nil {
 			logger.Error("db: create tenant failed", "tenantId", r.TenantID, "error", dbErr)
-			_ = sched.Delete(ctx, r.Config.Name)
+			_ = sched.Delete(ctx, r.TenantID)
 			resp, err = errResp(500, dbErr.Error())
 			goto done
 		}
 		logger.Info("db: tenant created", "tenantId", r.TenantID)
 
-		resp, err = respond(201, models.TenantWithConfig{
+		resp, err = respond(201, models.TenantWithSchedule{
 			TenantID:    r.TenantID,
 			PMSProvider: r.PMSProvider,
 			Config:      r.Config,
+			Schedule: &models.ScheduleInfo{
+				Expression: r.Expression,
+				Timezone:   r.Timezone,
+				State:      stateStr(r.Enabled),
+			},
 		})
 		goto done
 	}
@@ -150,7 +157,7 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 	{
 		tenantID := parts[1]
 
-		// GET /tenants/{id}
+		// GET /tenants/{id} — tenant + config from DB, schedule fetched live from EventBridge
 		if method == http.MethodGet && len(parts) == 2 {
 			t, dbErr := db.GetTenant(ctx, tenantID)
 			if dbErr != nil {
@@ -162,69 +169,37 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 				resp, err = errResp(404, "tenant not found")
 				goto done
 			}
-			resp, err = respond(200, t)
+
+			schedule, schedErr := sched.Get(ctx, tenantID)
+			if schedErr != nil {
+				logger.Error("scheduler: get failed", "tenantId", tenantID, "error", schedErr)
+				resp, err = errResp(500, fmt.Sprintf("scheduler: %v", schedErr))
+				goto done
+			}
+
+			resp, err = respond(200, models.TenantWithSchedule{
+				TenantID:    t.TenantID,
+				PMSProvider: t.PMSProvider,
+				Config:      t.Config,
+				Schedule:    schedule, // nil if no scheduler exists yet
+				CreatedAt:   t.CreatedAt,
+			})
 			goto done
 		}
 
-		// PUT /tenants/{id}/config
-		if method == http.MethodPut && len(parts) == 3 && parts[2] == "config" {
-			var r models.UpdateConfigRequest
+		// PUT /tenants/{id}/schedule — updates EventBridge only, no DB write
+		if method == http.MethodPut && len(parts) == 3 && parts[2] == "schedule" {
+			var r models.UpdateScheduleRequest
 			if jsonErr := json.Unmarshal([]byte(req.Body), &r); jsonErr != nil {
 				resp, err = errResp(400, "invalid request body")
 				goto done
 			}
-			if msg := validateConfig(r.Config); msg != "" {
+			if msg := validateSchedule(r.Expression, r.Timezone); msg != "" {
 				resp, err = errResp(400, msg)
 				goto done
 			}
 
-			// Fetch current config to detect schedule name change
-			current, dbErr := db.GetTenant(ctx, tenantID)
-			if dbErr != nil {
-				logger.Error("db: get tenant failed", "tenantId", tenantID, "error", dbErr)
-				resp, err = errResp(500, dbErr.Error())
-				goto done
-			}
-			if current == nil {
-				resp, err = errResp(404, "tenant not found")
-				goto done
-			}
-			oldName := current.Config.Name
-
-			// Schedule first, then DB
-			if schedErr := sched.Upsert(ctx, r.Config.Name, r.Config.Timezone, r.Config.Cron, tenantID, r.Config.Enabled); schedErr != nil {
-				logger.Error("scheduler: upsert failed", "tenantId", tenantID, "error", schedErr)
-				resp, err = errResp(500, fmt.Sprintf("scheduler: %v", schedErr))
-				goto done
-			}
-			logger.Info("scheduler: updated", "tenantId", tenantID, "scheduleName", r.Config.Name)
-
-			// Delete old scheduler if the name changed
-			if oldName != r.Config.Name {
-				if schedErr := sched.Delete(ctx, oldName); schedErr != nil {
-					logger.Error("scheduler: delete old name failed", "tenantId", tenantID, "oldName", oldName, "error", schedErr)
-				} else {
-					logger.Info("scheduler: old name deleted", "tenantId", tenantID, "oldName", oldName)
-				}
-			}
-
-			if dbErr := db.UpdateTenantConfig(ctx, tenantID, r.Config); dbErr != nil {
-				if dbErr == sql.ErrNoRows {
-					resp, err = errResp(404, "tenant not found")
-				} else {
-					logger.Error("db: update config failed", "tenantId", tenantID, "error", dbErr)
-					resp, err = errResp(500, dbErr.Error())
-				}
-				goto done
-			}
-			logger.Info("db: config updated", "tenantId", tenantID)
-			resp, err = respond(200, map[string]string{"status": "updated"})
-			goto done
-		}
-
-		// DELETE /tenants/{id}
-		if method == http.MethodDelete && len(parts) == 2 {
-			// Fetch config first to know the scheduler name
+			// Verify tenant exists before touching EventBridge
 			t, dbErr := db.GetTenant(ctx, tenantID)
 			if dbErr != nil {
 				logger.Error("db: get tenant failed", "tenantId", tenantID, "error", dbErr)
@@ -235,7 +210,63 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 				resp, err = errResp(404, "tenant not found")
 				goto done
 			}
-			scheduleName := t.Config.Name
+
+			if schedErr := sched.Upsert(ctx, tenantID, r.Expression, r.Timezone, r.Enabled); schedErr != nil {
+				logger.Error("scheduler: upsert failed", "tenantId", tenantID, "error", schedErr)
+				resp, err = errResp(500, fmt.Sprintf("scheduler: %v", schedErr))
+				goto done
+			}
+			logger.Info("scheduler: updated", "tenantId", tenantID)
+			resp, err = respond(200, map[string]string{"status": "updated"})
+			goto done
+		}
+
+		// PUT /tenants/{id}/config — updates tenant_config in DB only, no EventBridge call
+		if method == http.MethodPut && len(parts) == 3 && parts[2] == "config" {
+			var r models.UpdateConfigRequest
+			if jsonErr := json.Unmarshal([]byte(req.Body), &r); jsonErr != nil {
+				resp, err = errResp(400, "invalid request body")
+				goto done
+			}
+			if len(r.Config) == 0 {
+				resp, err = errResp(400, "config is required")
+				goto done
+			}
+
+			// Verify tenant exists
+			t, dbErr := db.GetTenant(ctx, tenantID)
+			if dbErr != nil {
+				logger.Error("db: get tenant failed", "tenantId", tenantID, "error", dbErr)
+				resp, err = errResp(500, dbErr.Error())
+				goto done
+			}
+			if t == nil {
+				resp, err = errResp(404, "tenant not found")
+				goto done
+			}
+
+			if dbErr := db.UpdateConfig(ctx, tenantID, r.Config); dbErr != nil {
+				logger.Error("db: update config failed", "tenantId", tenantID, "error", dbErr)
+				resp, err = errResp(500, dbErr.Error())
+				goto done
+			}
+			logger.Info("db: config updated", "tenantId", tenantID)
+			resp, err = respond(200, map[string]string{"status": "updated"})
+			goto done
+		}
+
+		// DELETE /tenants/{id}
+		if method == http.MethodDelete && len(parts) == 2 {
+			t, dbErr := db.GetTenant(ctx, tenantID)
+			if dbErr != nil {
+				logger.Error("db: get tenant failed", "tenantId", tenantID, "error", dbErr)
+				resp, err = errResp(500, dbErr.Error())
+				goto done
+			}
+			if t == nil {
+				resp, err = errResp(404, "tenant not found")
+				goto done
+			}
 
 			if dbErr := db.DeleteTenant(ctx, tenantID); dbErr != nil {
 				logger.Error("db: delete tenant failed", "tenantId", tenantID, "error", dbErr)
@@ -244,12 +275,12 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 			}
 			logger.Info("db: tenant deleted", "tenantId", tenantID)
 
-			if schedErr := sched.Delete(ctx, scheduleName); schedErr != nil {
+			if schedErr := sched.Delete(ctx, tenantID); schedErr != nil {
 				logger.Error("scheduler: delete failed", "tenantId", tenantID, "error", schedErr)
 				resp, err = errResp(500, fmt.Sprintf("delete scheduler: %v", schedErr))
 				goto done
 			}
-			logger.Info("scheduler: deleted", "tenantId", tenantID, "scheduleName", scheduleName)
+			logger.Info("scheduler: deleted", "tenantId", tenantID)
 			resp, err = respond(200, map[string]string{"status": "deleted"})
 			goto done
 		}

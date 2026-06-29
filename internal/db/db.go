@@ -28,130 +28,78 @@ func Ping(ctx context.Context) error {
 }
 
 func Migrate(ctx context.Context) error {
-	// Check if we're already on the new schema (tenant table exists).
-	// If not, drop the old tenant_config table and create both new tables.
-	var newSchemaExists bool
-	conn.QueryRowContext(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM information_schema.tables
-			WHERE table_schema='public' AND table_name='tenant'
-		)
-	`).Scan(&newSchemaExists)
-
-	if !newSchemaExists {
-		if _, err := conn.ExecContext(ctx, `DROP TABLE IF EXISTS tenant_config CASCADE`); err != nil {
-			return fmt.Errorf("drop old schema: %w", err)
-		}
-	}
-
 	_, err := conn.ExecContext(ctx, `
+		DROP TABLE IF EXISTS tenant_config CASCADE;
 		CREATE TABLE IF NOT EXISTS tenant (
 			tenant_id    VARCHAR(50)  PRIMARY KEY,
 			pms_provider VARCHAR(100) NOT NULL,
-			created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-		);
-		CREATE TABLE IF NOT EXISTS tenant_config (
-			tenant_id  VARCHAR(50) PRIMARY KEY REFERENCES tenant(tenant_id) ON DELETE CASCADE,
-			config     JSONB       NOT NULL,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			config       JSONB        NOT NULL DEFAULT '{}',
+			created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+			updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 		);
 	`)
 	return err
 }
 
-func CreateTenant(ctx context.Context, tenantID, pmsProvider string, cfg models.ScheduleConfig) error {
-	cfgJSON, err := json.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
+func CreateTenant(ctx context.Context, tenantID, pmsProvider string, config json.RawMessage) error {
+	if len(config) == 0 {
+		config = json.RawMessage(`{}`)
 	}
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx,
-		`INSERT INTO tenant (tenant_id, pms_provider) VALUES ($1, $2)`,
-		tenantID, pmsProvider,
-	); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx,
-		`INSERT INTO tenant_config (tenant_id, config) VALUES ($1, $2)`,
-		tenantID, cfgJSON,
-	); err != nil {
-		return err
-	}
-	return tx.Commit()
+	_, err := conn.ExecContext(ctx,
+		`INSERT INTO tenant (tenant_id, pms_provider, config) VALUES ($1, $2, $3)`,
+		tenantID, pmsProvider, []byte(config),
+	)
+	return err
 }
 
-func GetTenant(ctx context.Context, tenantID string) (*models.TenantWithConfig, error) {
-	var t models.TenantWithConfig
-	var cfgJSON []byte
-	err := conn.QueryRowContext(ctx, `
-		SELECT t.tenant_id, t.pms_provider, t.created_at, tc.config, tc.updated_at
-		FROM tenant t
-		JOIN tenant_config tc ON t.tenant_id = tc.tenant_id
-		WHERE t.tenant_id = $1
-	`, tenantID).Scan(&t.TenantID, &t.PMSProvider, &t.CreatedAt, &cfgJSON, &t.UpdatedAt)
+func UpdateConfig(ctx context.Context, tenantID string, config json.RawMessage) error {
+	_, err := conn.ExecContext(ctx,
+		`UPDATE tenant SET config = $2, updated_at = NOW() WHERE tenant_id = $1`,
+		tenantID, []byte(config),
+	)
+	return err
+}
+
+func GetTenant(ctx context.Context, tenantID string) (*models.Tenant, error) {
+	var t models.Tenant
+	var config []byte
+	err := conn.QueryRowContext(ctx,
+		`SELECT tenant_id, pms_provider, config, created_at FROM tenant WHERE tenant_id = $1`,
+		tenantID,
+	).Scan(&t.TenantID, &t.PMSProvider, &config, &t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(cfgJSON, &t.Config); err != nil {
-		return nil, fmt.Errorf("unmarshal config: %w", err)
-	}
+	t.Config = json.RawMessage(config)
 	return &t, nil
 }
 
-func ListTenants(ctx context.Context) ([]*models.TenantWithConfig, error) {
-	rows, err := conn.QueryContext(ctx, `
-		SELECT t.tenant_id, t.pms_provider, t.created_at, tc.config, tc.updated_at
-		FROM tenant t
-		JOIN tenant_config tc ON t.tenant_id = tc.tenant_id
-		ORDER BY t.tenant_id
-	`)
+func ListTenants(ctx context.Context) ([]*models.Tenant, error) {
+	rows, err := conn.QueryContext(ctx,
+		`SELECT tenant_id, pms_provider, config, created_at FROM tenant ORDER BY tenant_id`,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var list []*models.TenantWithConfig
+	var list []*models.Tenant
 	for rows.Next() {
-		var t models.TenantWithConfig
-		var cfgJSON []byte
-		if err := rows.Scan(&t.TenantID, &t.PMSProvider, &t.CreatedAt, &cfgJSON, &t.UpdatedAt); err != nil {
+		var t models.Tenant
+		var config []byte
+		if err := rows.Scan(&t.TenantID, &t.PMSProvider, &config, &t.CreatedAt); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal(cfgJSON, &t.Config); err != nil {
-			return nil, fmt.Errorf("unmarshal config: %w", err)
-		}
+		t.Config = json.RawMessage(config)
 		list = append(list, &t)
 	}
 	return list, nil
 }
 
-func UpdateTenantConfig(ctx context.Context, tenantID string, cfg models.ScheduleConfig) error {
-	cfgJSON, err := json.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
-	}
-	result, err := conn.ExecContext(ctx, `
-		UPDATE tenant_config SET config=$1, updated_at=NOW() WHERE tenant_id=$2
-	`, cfgJSON, tenantID)
-	if err != nil {
-		return err
-	}
-	n, _ := result.RowsAffected()
-	if n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
 func DeleteTenant(ctx context.Context, tenantID string) error {
-	_, err := conn.ExecContext(ctx, `DELETE FROM tenant WHERE tenant_id=$1`, tenantID)
+	_, err := conn.ExecContext(ctx, `DELETE FROM tenant WHERE tenant_id = $1`, tenantID)
 	return err
 }

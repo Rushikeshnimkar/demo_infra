@@ -1,28 +1,47 @@
 package models
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
-type ScheduleConfig struct {
-	Name     string `json:"name"`
-	Timezone string `json:"timezone"`
-	Cron     string `json:"cron"`
-	Enabled  bool   `json:"enabled"`
+type Tenant struct {
+	TenantID    string          `json:"tenantId"`
+	PMSProvider string          `json:"pmsProvider"`
+	Config      json.RawMessage `json:"config,omitempty"`
+	CreatedAt   time.Time       `json:"createdAt"`
 }
 
-type TenantWithConfig struct {
-	TenantID    string         `json:"tenantId"`
-	PMSProvider string         `json:"pmsProvider"`
-	Config      ScheduleConfig `json:"config"`
-	CreatedAt   time.Time      `json:"createdAt"`
-	UpdatedAt   time.Time      `json:"updatedAt"`
+// ScheduleInfo is fetched live from EventBridge — never stored in the DB.
+type ScheduleInfo struct {
+	Expression string `json:"expression"`
+	Timezone   string `json:"timezone"`
+	State      string `json:"state"` // "ENABLED" or "DISABLED"
+}
+
+type TenantWithSchedule struct {
+	TenantID    string          `json:"tenantId"`
+	PMSProvider string          `json:"pmsProvider"`
+	Config      json.RawMessage `json:"config,omitempty"`
+	Schedule    *ScheduleInfo   `json:"schedule,omitempty"`
+	CreatedAt   time.Time       `json:"createdAt"`
 }
 
 type CreateTenantRequest struct {
-	TenantID    string         `json:"tenantId"`
-	PMSProvider string         `json:"pmsProvider"`
-	Config      ScheduleConfig `json:"config"`
+	TenantID    string          `json:"tenantId"`
+	PMSProvider string          `json:"pmsProvider"`
+	Config      json.RawMessage `json:"config,omitempty"`
+	Expression  string          `json:"expression"`
+	Timezone    string          `json:"timezone"`
+	Enabled     bool            `json:"enabled"`
+}
+
+type UpdateScheduleRequest struct {
+	Expression string `json:"expression"`
+	Timezone   string `json:"timezone"`
+	Enabled    bool   `json:"enabled"`
 }
 
 type UpdateConfigRequest struct {
-	Config ScheduleConfig `json:"config"`
+	Config json.RawMessage `json:"config"`
 }
